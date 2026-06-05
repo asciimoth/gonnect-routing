@@ -1,4 +1,4 @@
-module github.com/asciimoth/sysnet-debug
+module github.com/asciimoth/gonnect-routing
 
 go 1.25.5
 
