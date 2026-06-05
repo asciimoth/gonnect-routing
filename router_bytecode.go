@@ -35,9 +35,14 @@ type BytecodeRules struct {
 	Lookup    []byte
 }
 
+type RouterCfg interface {
+	gonnect.RouterCfg
+	SlotReporter
+}
+
 // NewBytecodeRouterCfg validates rules and returns a gonnect.RouterCfg that
 // evaluates stack-based bytecode for each Router operation.
-func NewBytecodeRouterCfg(rules BytecodeRules) (gonnect.RouterCfg, error) {
+func NewBytecodeRouterCfg(rules BytecodeRules) (RouterCfg, error) {
 	cfg := &bytecodeRouterCfg{
 		strings:     append([]string(nil), rules.Strings...),
 		regexps:     append([]*regexp.Regexp(nil), rules.Regexps...),

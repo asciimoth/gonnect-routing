@@ -30,9 +30,14 @@ type SplitBytecodeRules struct {
 	Route []byte
 }
 
+type SplitRouter interface {
+	tun.SplitRouter
+	SlotReporter
+}
+
 // NewBytecodeSplitRouter validates rules and returns a tun.SplitRouter that
 // evaluates stack-based bytecode against IP packets.
-func NewBytecodeSplitRouter(rules SplitBytecodeRules) (tun.SplitRouter, error) {
+func NewBytecodeSplitRouter(rules SplitBytecodeRules) (SplitRouter, error) {
 	cfg := &bytecodeSplitRouter{
 		matcher:     rules.Matcher,
 		strings:     append([]string(nil), rules.Strings...),

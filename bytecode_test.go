@@ -193,19 +193,14 @@ func TestBytecodeRouterCfgReportsMentionedSlots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
 	}
-	reporter, ok := cfg.(SlotReporter)
-	if !ok {
-		t.Fatal("NewBytecodeRouterCfg() result does not implement SlotReporter")
-	}
-
-	got := reporter.MentionedSlots()
+	got := cfg.MentionedSlots()
 	want := []int{1, 2, 7, 16}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("MentionedSlots() = %v, want %v", got, want)
 	}
 
 	got[0] = 99
-	if got := reporter.MentionedSlots(); !reflect.DeepEqual(got, want) {
+	if got := cfg.MentionedSlots(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("MentionedSlots() after caller mutation = %v, want %v", got, want)
 	}
 }
@@ -478,19 +473,15 @@ func TestBytecodeSplitRouterReportsMentionedSlots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
 	}
-	reporter, ok := router.(SlotReporter)
-	if !ok {
-		t.Fatal("NewBytecodeSplitRouter() result does not implement SlotReporter")
-	}
 
-	got := reporter.MentionedSlots()
+	got := router.MentionedSlots()
 	want := []int{4, 16}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("MentionedSlots() = %v, want %v", got, want)
 	}
 
 	got[0] = 99
-	if got := reporter.MentionedSlots(); !reflect.DeepEqual(got, want) {
+	if got := router.MentionedSlots(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("MentionedSlots() after caller mutation = %v, want %v", got, want)
 	}
 }
