@@ -42,6 +42,56 @@ func NewBytecodeRules(
 	return rules, nil
 }
 
+// NewBytecodeRulesProgram parses one routing rules program and derives the five
+// RouterCfg method programs from it.
+//
+// The input is split into independent segments. A segment ends at a DROP or
+// SLOT operation, matched case-insensitively, or at the end of the string. Each
+// derived method program receives only the segments that can still affect that
+// method:
+//   - segments without DIAL, LISTEN, or LOOKUP are copied to every method;
+//   - segments with method operations are omitted only when their terminal DROP
+//     or SLOT condition is provably false for that method.
+//
+// The proof is intentionally conservative. Method operations are evaluated as
+// constants for the target method, TRUE/FALSE/NOT/AND/OR are evaluated exactly,
+// and every runtime-dependent predicate is treated as unknown. Unknown, invalid,
+// or unterminated segments are kept and then validated normally by
+// NewBytecodeRouterCfg.
+func NewBytecodeRulesProgram(program string) (BytecodeRules, error) {
+	p := newBytecodeParser()
+	var rules BytecodeRules
+	segments := splitBytecodeRuleSegments(program)
+	programs := []struct {
+		name   string
+		method bytecodeMethod
+		dst    *[]byte
+	}{
+		{name: "DialTCP", method: bytecodeMethodDial, dst: &rules.DialTCP},
+		{name: "ListenTCP", method: bytecodeMethodListen, dst: &rules.ListenTCP},
+		{name: "DialUDP", method: bytecodeMethodDial, dst: &rules.DialUDP},
+		{name: "RouteUDP", method: bytecodeMethodDial, dst: &rules.RouteUDP},
+		{name: "Lookup", method: bytecodeMethodLookup, dst: &rules.Lookup},
+	}
+	for _, segment := range segments {
+		for _, target := range programs {
+			if !bytecodeSegmentCanTrigger(segment, target.method) {
+				continue
+			}
+			code, err := p.parseProgramLines(target.name, segment)
+			if err != nil {
+				return BytecodeRules{}, err
+			}
+			*target.dst = append(*target.dst, code...)
+		}
+	}
+	p.apply(&rules)
+	if _, err := NewBytecodeRouterCfg(rules); err != nil {
+		return BytecodeRules{}, err
+	}
+	return rules, nil
+}
+
 // NewSplitBytecodeRules parses the simple routing rules language into SplitBytecodeRules.
 func NewSplitBytecodeRules(
 	matcher sysnet.IPMatcher,
@@ -105,9 +155,33 @@ func (p *bytecodeParser) applySplit(rules *SplitBytecodeRules) {
 }
 
 func (p *bytecodeParser) parseProgram(name, src string) ([]byte, error) {
+	return p.parseProgramLines(name, splitBytecodeRuleLines(src))
+}
+
+type bytecodeRuleLine struct {
+	no   int
+	text string
+}
+
+func splitBytecodeRuleLines(src string) []bytecodeRuleLine {
+	lines := strings.Split(src, "\n")
+	out := make([]bytecodeRuleLine, 0, len(lines))
+	for i, line := range lines {
+		out = append(out, bytecodeRuleLine{
+			no:   i + 1,
+			text: strings.TrimRight(line, "\r"),
+		})
+	}
+	return out
+}
+
+func (p *bytecodeParser) parseProgramLines(
+	name string,
+	lines []bytecodeRuleLine,
+) ([]byte, error) {
 	var code []byte
-	for lineNo, line := range strings.Split(src, "\n") {
-		line = strings.TrimRight(line, "\r")
+	for _, srcLine := range lines {
+		line := srcLine.text
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
@@ -118,17 +192,159 @@ func (p *bytecodeParser) parseProgram(name, src string) ([]byte, error) {
 			return nil, fmt.Errorf(
 				"%s line %d: unknown operation %q",
 				name,
-				lineNo+1,
+				srcLine.no,
 				opName,
 			)
 		}
 		next, err := p.appendOp(code, op, arg, hasArg)
 		if err != nil {
-			return nil, fmt.Errorf("%s line %d: %w", name, lineNo+1, err)
+			return nil, fmt.Errorf("%s line %d: %w", name, srcLine.no, err)
 		}
 		code = next
 	}
 	return code, nil
+}
+
+func splitBytecodeRuleSegments(src string) [][]bytecodeRuleLine {
+	lines := splitBytecodeRuleLines(src)
+	var segments [][]bytecodeRuleLine
+	var segment []bytecodeRuleLine
+	for _, line := range lines {
+		segment = append(segment, line)
+		if bytecodeRuleLineEndsSegment(line.text) {
+			segments = append(segments, segment)
+			segment = nil
+		}
+	}
+	if len(segment) > 0 {
+		segments = append(segments, segment)
+	}
+	return segments
+}
+
+func bytecodeRuleLineEndsSegment(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return false
+	}
+	opName, _, _ := splitRuleLine(line)
+	switch strings.ToUpper(opName) {
+	case "DROP", "SLOT":
+		return true
+	default:
+		return false
+	}
+}
+
+type bytecodeBoolState uint8
+
+const (
+	bytecodeBoolFalse bytecodeBoolState = iota
+	bytecodeBoolTrue
+	bytecodeBoolUnknown
+)
+
+func bytecodeSegmentCanTrigger(
+	segment []bytecodeRuleLine,
+	method bytecodeMethod,
+) bool {
+	var stack []bytecodeBoolState
+	hasMethodOp := false
+	for _, srcLine := range segment {
+		line := srcLine.text
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		opName, _, _ := splitRuleLine(line)
+		op, ok := bytecodeOpByName[strings.ToUpper(opName)]
+		if !ok {
+			return true
+		}
+		switch op {
+		case OP_DROP, OP_SLOT:
+			if len(stack) < 1 {
+				return true
+			}
+			condition := stack[len(stack)-1]
+			return !hasMethodOp || condition != bytecodeBoolFalse
+		case OP_TRUE:
+			stack = append(stack, bytecodeBoolTrue)
+		case OP_FALSE:
+			stack = append(stack, bytecodeBoolFalse)
+		case OP_NOT:
+			if len(stack) < 1 {
+				return true
+			}
+			stack[len(stack)-1] = bytecodeBoolNot(stack[len(stack)-1])
+		case OP_AND:
+			if len(stack) < 2 {
+				return true
+			}
+			b := stack[len(stack)-1]
+			a := stack[len(stack)-2]
+			stack = stack[:len(stack)-2]
+			stack = append(stack, bytecodeBoolAnd(a, b))
+		case OP_OR:
+			if len(stack) < 2 {
+				return true
+			}
+			b := stack[len(stack)-1]
+			a := stack[len(stack)-2]
+			stack = stack[:len(stack)-2]
+			stack = append(stack, bytecodeBoolOr(a, b))
+		case OP_DIAL:
+			hasMethodOp = true
+			stack = append(stack, bytecodeBoolFromBool(method == bytecodeMethodDial))
+		case OP_LISTEN:
+			hasMethodOp = true
+			stack = append(stack, bytecodeBoolFromBool(method == bytecodeMethodListen))
+		case OP_LOOKUP:
+			hasMethodOp = true
+			stack = append(stack, bytecodeBoolFromBool(method == bytecodeMethodLookup))
+		default:
+			stack = append(stack, bytecodeBoolUnknown)
+		}
+	}
+	return true
+}
+
+func bytecodeBoolFromBool(v bool) bytecodeBoolState {
+	if v {
+		return bytecodeBoolTrue
+	}
+	return bytecodeBoolFalse
+}
+
+func bytecodeBoolNot(v bytecodeBoolState) bytecodeBoolState {
+	switch v {
+	case bytecodeBoolFalse:
+		return bytecodeBoolTrue
+	case bytecodeBoolTrue:
+		return bytecodeBoolFalse
+	default:
+		return bytecodeBoolUnknown
+	}
+}
+
+func bytecodeBoolAnd(a, b bytecodeBoolState) bytecodeBoolState {
+	if a == bytecodeBoolFalse || b == bytecodeBoolFalse {
+		return bytecodeBoolFalse
+	}
+	if a == bytecodeBoolTrue && b == bytecodeBoolTrue {
+		return bytecodeBoolTrue
+	}
+	return bytecodeBoolUnknown
+}
+
+func bytecodeBoolOr(a, b bytecodeBoolState) bytecodeBoolState {
+	if a == bytecodeBoolTrue || b == bytecodeBoolTrue {
+		return bytecodeBoolTrue
+	}
+	if a == bytecodeBoolFalse && b == bytecodeBoolFalse {
+		return bytecodeBoolFalse
+	}
+	return bytecodeBoolUnknown
 }
 
 func splitRuleLine(line string) (op, arg string, hasArg bool) {
