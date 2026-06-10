@@ -149,7 +149,8 @@ func (p *bytecodeParser) appendOp(
 ) ([]byte, error) {
 	switch op {
 	case OP_DROP, OP_TRUE, OP_FALSE, OP_NOT, OP_AND, OP_OR,
-		OP_NET4, OP_NET6, OP_UDP, OP_TCP, OP_FQDN, OP_LFQDN:
+		OP_NET4, OP_NET6, OP_UDP, OP_TCP, OP_FQDN, OP_LFQDN,
+		OP_DIAL, OP_LISTEN, OP_LOOKUP:
 		if hasArg && strings.TrimSpace(arg) != "" {
 			return nil, fmt.Errorf(
 				"operation %s does not accept an argument",
@@ -571,4 +572,7 @@ var bytecodeOpByName = map[string]byte{
 	"UEXP":     OP_UEXP,
 	"MARK":     OP_MARK,
 	"PID":      OP_PID,
+	"DIAL":     OP_DIAL,
+	"LISTEN":   OP_LISTEN,
+	"LOOKUP":   OP_LOOKUP,
 }

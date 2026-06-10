@@ -16,7 +16,9 @@ import (
 //
 // The packet router supports the common bytecode opcodes plus OP_RULE,
 // OP_CGRP, OP_UID, OP_GID, OP_UNAME, OP_UEXP, OP_MARK, and OP_PID. The
-// constructor validates and copies all slices before returning the router.
+// RouterCfg method opcodes OP_DIAL, OP_LISTEN, and OP_LOOKUP are not valid for
+// packet routing. The constructor validates and copies all slices before
+// returning the router.
 type SplitBytecodeRules struct {
 	Matcher sysnet.IPMatcher
 
@@ -268,6 +270,13 @@ func (cfg *bytecodeSplitRouter) validateOp(
 	param uint64,
 	kind bytecodeParamKind,
 ) error {
+	if isRouterMethodOp(op) {
+		return fmt.Errorf(
+			"SplitRoute bytecode offset %d: opcode %d is not valid for SplitRouter",
+			pc,
+			op,
+		)
+	}
 	if kind == bytecodeParamNone {
 		return nil
 	}

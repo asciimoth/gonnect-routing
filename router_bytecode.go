@@ -17,6 +17,9 @@ import (
 // when it has one. OP_SLOT uses one uint8 parameter. String, regexp, address,
 // subnet, and port operations use one little-endian uint16 parameter. A program
 // routes to slot 0 when it finishes without a matching OP_DROP or OP_SLOT.
+// OP_DIAL, OP_LISTEN, and OP_LOOKUP push the current RouterCfg method class:
+// DialTCP, DialUDP, and RouteUDP are dial operations; ListenTCP is a listen
+// operation; Lookup is a lookup operation.
 //
 // Every bytecode slice is validated by NewBytecodeRouterCfg. The constructor
 // copies all slices, so later changes to BytecodeRules do not affect routing.
@@ -87,6 +90,14 @@ type bytecodeRouterCfg struct {
 	mentionedSlots []int
 }
 
+type bytecodeMethod uint8
+
+const (
+	bytecodeMethodDial bytecodeMethod = iota
+	bytecodeMethodListen
+	bytecodeMethodLookup
+)
+
 var _ gonnect.RouterCfg = (*bytecodeRouterCfg)(nil)
 var _ SlotReporter = (*bytecodeRouterCfg)(nil)
 
@@ -97,6 +108,7 @@ func (cfg *bytecodeRouterCfg) MentionedSlots() []int {
 func (cfg *bytecodeRouterCfg) DialTCP(network, laddr, raddr string) int {
 	return cfg.exec(
 		cfg.dialTCP,
+		bytecodeMethodDial,
 		network,
 		addrInput{str: laddr},
 		addrInput{str: raddr},
@@ -104,12 +116,19 @@ func (cfg *bytecodeRouterCfg) DialTCP(network, laddr, raddr string) int {
 }
 
 func (cfg *bytecodeRouterCfg) ListenTCP(network, laddr string) int {
-	return cfg.exec(cfg.listenTCP, network, addrInput{str: laddr}, addrInput{})
+	return cfg.exec(
+		cfg.listenTCP,
+		bytecodeMethodListen,
+		network,
+		addrInput{str: laddr},
+		addrInput{},
+	)
 }
 
 func (cfg *bytecodeRouterCfg) DialUDP(network, laddr, raddr string) int {
 	return cfg.exec(
 		cfg.dialUDP,
+		bytecodeMethodDial,
 		network,
 		addrInput{str: laddr},
 		addrInput{str: raddr},
@@ -122,6 +141,7 @@ func (cfg *bytecodeRouterCfg) RouteUDP(
 ) int {
 	return cfg.exec(
 		cfg.routeUDP,
+		bytecodeMethodDial,
 		network,
 		addrInput{addr: laddr},
 		addrInput{addr: raddr},
@@ -129,7 +149,13 @@ func (cfg *bytecodeRouterCfg) RouteUDP(
 }
 
 func (cfg *bytecodeRouterCfg) Lookup(network, address string) int {
-	return cfg.exec(cfg.lookup, network, addrInput{}, addrInput{str: address})
+	return cfg.exec(
+		cfg.lookup,
+		bytecodeMethodLookup,
+		network,
+		addrInput{},
+		addrInput{str: address},
+	)
 }
 
 func (cfg *bytecodeRouterCfg) validate() error {
@@ -267,13 +293,17 @@ func (cfg *bytecodeRouterCfg) validateOpIndex(
 
 func (cfg *bytecodeRouterCfg) exec(
 	code []byte,
+	method bytecodeMethod,
 	network string,
 	laddr, raddr addrInput,
 ) int {
 	ev := bytecodeEval{
-		network: strings.ToLower(network),
-		laddr:   newAddrCache(laddr),
-		raddr:   newAddrCache(raddr),
+		network:  strings.ToLower(network),
+		laddr:    newAddrCache(laddr),
+		raddr:    newAddrCache(raddr),
+		isDial:   method == bytecodeMethodDial,
+		isListen: method == bytecodeMethodListen,
+		isLookup: method == bytecodeMethodLookup,
 	}
 	stack := make([]bool, 0, 8)
 	for pc := 0; pc < len(code); {
@@ -316,6 +346,12 @@ func (cfg *bytecodeRouterCfg) exec(
 			stack = append(stack, isUDPNet(ev.network))
 		case OP_TCP:
 			stack = append(stack, isTCPNet(ev.network))
+		case OP_DIAL:
+			stack = append(stack, ev.isDial)
+		case OP_LISTEN:
+			stack = append(stack, ev.isListen)
+		case OP_LOOKUP:
+			stack = append(stack, ev.isLookup)
 		case OP_FQDN:
 			stack = append(stack, ev.raddr.isFQDN())
 		case OP_LFQDN:

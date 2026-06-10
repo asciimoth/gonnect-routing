@@ -82,6 +82,59 @@ func TestBytecodeRouterCfgRoutesByBytecode(t *testing.T) {
 	}
 }
 
+func TestBytecodeRouterCfgMethodOps(t *testing.T) {
+	cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+		DialTCP: []byte{
+			OP_LISTEN, OP_SLOT, 9,
+			OP_LOOKUP, OP_SLOT, 10,
+			OP_DIAL, OP_SLOT, 2,
+		},
+		ListenTCP: []byte{
+			OP_DIAL, OP_SLOT, 9,
+			OP_LOOKUP, OP_SLOT, 10,
+			OP_LISTEN, OP_SLOT, 3,
+		},
+		DialUDP: []byte{
+			OP_LISTEN, OP_SLOT, 9,
+			OP_LOOKUP, OP_SLOT, 10,
+			OP_DIAL, OP_SLOT, 4,
+		},
+		RouteUDP: []byte{
+			OP_LISTEN, OP_SLOT, 9,
+			OP_LOOKUP, OP_SLOT, 10,
+			OP_DIAL, OP_SLOT, 5,
+		},
+		Lookup: []byte{
+			OP_DIAL, OP_SLOT, 9,
+			OP_LISTEN, OP_SLOT, 10,
+			OP_LOOKUP, OP_SLOT, 6,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+	}
+
+	if got := cfg.DialTCP("tcp", "", "example.com:443"); got != 2 {
+		t.Fatalf("DialTCP method route = %d, want 2", got)
+	}
+	if got := cfg.ListenTCP("tcp", "127.0.0.1:80"); got != 3 {
+		t.Fatalf("ListenTCP method route = %d, want 3", got)
+	}
+	if got := cfg.DialUDP("udp", "", "192.0.2.1:53"); got != 4 {
+		t.Fatalf("DialUDP method route = %d, want 4", got)
+	}
+	if got := cfg.RouteUDP(
+		"udp",
+		&net.UDPAddr{IP: net.IPv4(10, 1, 2, 3), Port: 1234},
+		&net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 53},
+	); got != 5 {
+		t.Fatalf("RouteUDP method route = %d, want 5", got)
+	}
+	if got := cfg.Lookup("ip", "example.com"); got != 6 {
+		t.Fatalf("Lookup method route = %d, want 6", got)
+	}
+}
+
 func TestBytecodeRouterCfgNetworkFamily(t *testing.T) {
 	cfg, err := NewBytecodeRouterCfg(BytecodeRules{
 		DialTCP: append(
@@ -495,6 +548,17 @@ func TestBytecodeSplitRouterValidation(t *testing.T) {
 		!strings.Contains(err.Error(), "string index 0 out of range 0") {
 		t.Fatalf(
 			"NewBytecodeSplitRouter() error = %v, want string index error",
+			err,
+		)
+	}
+	_, err = NewBytecodeSplitRouter(SplitBytecodeRules{
+		Matcher: &testIPMatcher{},
+		Route:   []byte{OP_DIAL, OP_SLOT, 1},
+	})
+	if err == nil ||
+		!strings.Contains(err.Error(), "not valid for SplitRouter") {
+		t.Fatalf(
+			"NewBytecodeSplitRouter(method op) error = %v, want SplitRouter validation error",
 			err,
 		)
 	}

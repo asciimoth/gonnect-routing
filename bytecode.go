@@ -82,6 +82,12 @@ const (
 	OP_MARK
 	// OP_PID pushes whether IPMatcher packet info has the following pid.
 	OP_PID
+	// OP_DIAL pushes whether the RouterCfg method is DialTCP, DialUDP, or RouteUDP.
+	OP_DIAL
+	// OP_LISTEN pushes whether the RouterCfg method is ListenTCP.
+	OP_LISTEN
+	// OP_LOOKUP pushes whether the RouterCfg method is Lookup.
+	OP_LOOKUP
 )
 
 // IPv4Subnet is an IPv4 CIDR subnet used by bytecode routing rules.
@@ -194,7 +200,8 @@ func readBytecodeParam(
 ) (uint64, bytecodeParamKind, error) {
 	switch op {
 	case OP_DROP, OP_TRUE, OP_FALSE, OP_NOT, OP_AND, OP_OR,
-		OP_NET4, OP_NET6, OP_UDP, OP_TCP, OP_FQDN, OP_LFQDN:
+		OP_NET4, OP_NET6, OP_UDP, OP_TCP, OP_FQDN, OP_LFQDN,
+		OP_DIAL, OP_LISTEN, OP_LOOKUP:
 		return 0, bytecodeParamNone, nil
 	case OP_SLOT:
 		if *pc >= len(code) {
@@ -307,9 +314,12 @@ func popBool(stack *[]bool) bool {
 }
 
 type bytecodeEval struct {
-	network string
-	laddr   *addrCache
-	raddr   *addrCache
+	network  string
+	laddr    *addrCache
+	raddr    *addrCache
+	isDial   bool
+	isListen bool
+	isLookup bool
 }
 
 func (ev *bytecodeEval) isNet4() bool {
@@ -566,6 +576,15 @@ func isLAddrOp(op byte) bool {
 func isSplitOnlyOp(op byte) bool {
 	switch op {
 	case OP_RULE, OP_CGRP, OP_UID, OP_GID, OP_UNAME, OP_UEXP, OP_MARK, OP_PID:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRouterMethodOp(op byte) bool {
+	switch op {
+	case OP_DIAL, OP_LISTEN, OP_LOOKUP:
 		return true
 	default:
 		return false

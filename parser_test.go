@@ -59,6 +59,43 @@ SLOT 2
 	}
 }
 
+func TestNewBytecodeRulesParsesRouterMethodOps(t *testing.T) {
+	rules, err := NewBytecodeRules(
+		"DIAL\nSLOT 2\n",
+		"LISTEN\nSLOT 3\n",
+		"DIAL\nSLOT 4\n",
+		"DIAL\nLISTEN\nLOOKUP\nOR\nOR\nNOT\nSLOT 5\nDIAL\nSLOT 6\n",
+		"LOOKUP\nSLOT 7\n",
+	)
+	if err != nil {
+		t.Fatalf("NewBytecodeRules() error = %v", err)
+	}
+
+	checks := []struct {
+		name string
+		got  []byte
+		want []byte
+	}{
+		{name: "DialTCP", got: rules.DialTCP, want: []byte{OP_DIAL, OP_SLOT, 2}},
+		{name: "ListenTCP", got: rules.ListenTCP, want: []byte{OP_LISTEN, OP_SLOT, 3}},
+		{name: "DialUDP", got: rules.DialUDP, want: []byte{OP_DIAL, OP_SLOT, 4}},
+		{
+			name: "RouteUDP",
+			got:  rules.RouteUDP,
+			want: []byte{
+				OP_DIAL, OP_LISTEN, OP_LOOKUP, OP_OR, OP_OR, OP_NOT, OP_SLOT, 5,
+				OP_DIAL, OP_SLOT, 6,
+			},
+		},
+		{name: "Lookup", got: rules.Lookup, want: []byte{OP_LOOKUP, OP_SLOT, 7}},
+	}
+	for _, check := range checks {
+		if !bytes.Equal(check.got, check.want) {
+			t.Fatalf("%s bytecode = %#v, want %#v", check.name, check.got, check.want)
+		}
+	}
+}
+
 func TestNewBytecodeRulesRejectsInlineCommentOnNoArgOperation(t *testing.T) {
 	_, err := NewBytecodeRules(
 		"TRUE # inline comments are not comments\n",
@@ -133,6 +170,16 @@ SLOT 3
 	want := append(param32(OP_MARK, 0x0111010), OP_SLOT, 3)
 	if !bytes.Equal(rules.Route, want) {
 		t.Fatalf("Route bytecode = %#v, want %#v", rules.Route, want)
+	}
+}
+
+func TestNewSplitBytecodeRulesRejectsRouterMethodOps(t *testing.T) {
+	_, err := NewSplitBytecodeRules(&testIPMatcher{}, "DIAL\nSLOT 1\n")
+	if err == nil || !strings.Contains(err.Error(), "not valid for SplitRouter") {
+		t.Fatalf(
+			"NewSplitBytecodeRules() error = %v, want SplitRouter validation error",
+			err,
+		)
 	}
 }
 
