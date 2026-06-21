@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
+	sysnetdebug "github.com/asciimoth/gonnect/sysnet/debug"
 )
 
 func TestBytecodeRouterCfgRoutesByBytecode(t *testing.T) {
@@ -273,7 +275,7 @@ func TestBytecodeRouterCfgValidation(t *testing.T) {
 		{
 			name: "split opcode",
 			rules: BytecodeRules{
-				DialTCP: append([]byte{OP_RULE}, param64Bytes(1)...),
+				DialTCP: param16(OP_RULE, 0),
 			},
 			want: "not valid for RouterCfg",
 		},
@@ -383,9 +385,8 @@ func TestBytecodeRouterCfgValidation(t *testing.T) {
 }
 
 func TestBytecodeSplitRouterRoutesPackets(t *testing.T) {
-	matcher := &testIPMatcher{}
 	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
-		Matcher:   matcher,
+		System:    &sysnetdebug.System{},
 		IPv4Addrs: []uint32{ip4(192, 0, 2, 2)},
 		Route: append(
 			append(
@@ -415,46 +416,35 @@ func TestBytecodeSplitRouterRoutesPackets(t *testing.T) {
 	if got != 4 {
 		t.Fatalf("Route() = %d, want 4", got)
 	}
-	if matcher.locks != 1 || matcher.unlocks != 1 {
-		t.Fatalf(
-			"matcher locks = %d/%d, want 1/1",
-			matcher.locks,
-			matcher.unlocks,
-		)
-	}
 	if got := cfg.Route(buf[:3], 3, false); got != 0 {
 		t.Fatalf("Route(malformed) = %d, want 0", got)
 	}
 }
 
 func TestBytecodeSplitRouterMatcherCaching(t *testing.T) {
-	matcher := &testIPMatcher{
-		rules: map[uint64]bool{42: true},
-		info: &sysnet.NetInfo{
-			UID:       1000,
-			User:      "alice",
-			RouteMark: -7,
-			PID:       123,
+	rule := sysnet.Rule{Type: "test", Rule: "cached rule"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == rule &&
+				flow.Proto == "tcp" &&
+				flow.LocalPort == 1 &&
+				flow.RemotePort == 2, nil
 		},
 	}
 	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
-		Matcher: matcher,
-		Strings: []string{"alice"},
+		System: system,
+		Rules:  []sysnet.Rule{rule},
 		Route: append(
 			append(
 				append(
-					append([]byte{OP_RULE}, param64Bytes(42)...),
-					append([]byte{OP_RULE}, param64Bytes(42)...)...,
+					param16(OP_RULE, 0),
+					param16(OP_RULE, 0)...,
 				),
 				OP_AND,
 			),
-			append(
-				append(
-					append(param64(OP_UID, 1000), param16(OP_UNAME, 0)...),
-					OP_AND,
-				),
-				append(param32(OP_MARK, ^uint32(6)), OP_AND, OP_SLOT, 8)...,
-			)...,
+			OP_SLOT, 8,
 		),
 	})
 	if err != nil {
@@ -468,30 +458,24 @@ func TestBytecodeSplitRouterMatcherCaching(t *testing.T) {
 	); got != 8 {
 		t.Fatalf("Route() = %d, want 8", got)
 	}
-	if matcher.matchCalls != 1 {
-		t.Fatalf("Match calls = %d, want 1", matcher.matchCalls)
-	}
-	if matcher.infoCalls != 1 {
-		t.Fatalf("PktInfo calls = %d, want 1", matcher.infoCalls)
+	if matchCalls != 1 {
+		t.Fatalf("Match calls = %d, want 1", matchCalls)
 	}
 }
 
 func TestBytecodeSplitRouterSkipsMatcherForNonNativePackets(t *testing.T) {
-	matcher := &testIPMatcher{
-		rules: map[uint64]bool{42: true},
-		info: &sysnet.NetInfo{
-			UID: 1000,
+	rule := sysnet.Rule{Type: "test", Rule: "native only"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return true, nil
 		},
 	}
 	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
-		Matcher: matcher,
-		Route: append(
-			append(
-				append([]byte{OP_RULE}, param64Bytes(42)...),
-				param64(OP_UID, 1000)...,
-			),
-			OP_OR, OP_SLOT, 8,
-		),
+		System: system,
+		Rules:  []sysnet.Rule{rule},
+		Route:  append(param16(OP_RULE, 0), OP_SLOT, 8),
 	})
 	if err != nil {
 		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
@@ -504,17 +488,14 @@ func TestBytecodeSplitRouterSkipsMatcherForNonNativePackets(t *testing.T) {
 	); got != 0 {
 		t.Fatalf("Route(non-native) = %d, want 0", got)
 	}
-	if matcher.matchCalls != 0 {
-		t.Fatalf("Match calls = %d, want 0", matcher.matchCalls)
-	}
-	if matcher.infoCalls != 0 {
-		t.Fatalf("PktInfo calls = %d, want 0", matcher.infoCalls)
+	if matchCalls != 0 {
+		t.Fatalf("Match calls = %d, want 0", matchCalls)
 	}
 }
 
 func TestBytecodeSplitRouterReportsMentionedSlots(t *testing.T) {
 	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
-		Matcher: &testIPMatcher{},
+		System: &sysnetdebug.System{},
 		Route: []byte{
 			OP_TRUE, OP_SLOT, 4,
 			OP_TRUE, OP_SLOT, 0,
@@ -541,19 +522,19 @@ func TestBytecodeSplitRouterReportsMentionedSlots(t *testing.T) {
 
 func TestBytecodeSplitRouterValidation(t *testing.T) {
 	_, err := NewBytecodeSplitRouter(SplitBytecodeRules{
-		Matcher: &testIPMatcher{},
-		Route:   param16(OP_UNAME, 0),
+		System: &sysnetdebug.System{},
+		Route:  param16(OP_RULE, 0),
 	})
 	if err == nil ||
-		!strings.Contains(err.Error(), "string index 0 out of range 0") {
+		!strings.Contains(err.Error(), "rule index 0 out of range 0") {
 		t.Fatalf(
-			"NewBytecodeSplitRouter() error = %v, want string index error",
+			"NewBytecodeSplitRouter() error = %v, want rule index error",
 			err,
 		)
 	}
 	_, err = NewBytecodeSplitRouter(SplitBytecodeRules{
-		Matcher: &testIPMatcher{},
-		Route:   []byte{OP_DIAL, OP_SLOT, 1},
+		System: &sysnetdebug.System{},
+		Route:  []byte{OP_DIAL, OP_SLOT, 1},
 	})
 	if err == nil ||
 		!strings.Contains(err.Error(), "not valid for SplitRouter") {
@@ -563,9 +544,9 @@ func TestBytecodeSplitRouterValidation(t *testing.T) {
 		)
 	}
 	_, err = NewBytecodeSplitRouter(SplitBytecodeRules{})
-	if err == nil || !strings.Contains(err.Error(), "matcher is nil") {
+	if err == nil || !strings.Contains(err.Error(), "system is nil") {
 		t.Fatalf(
-			"NewBytecodeSplitRouter(nil matcher) error = %v, want nil matcher error",
+			"NewBytecodeSplitRouter(nil system) error = %v, want nil system error",
 			err,
 		)
 	}
@@ -574,22 +555,6 @@ func TestBytecodeSplitRouterValidation(t *testing.T) {
 func param16(op byte, param uint16) []byte {
 	out := []byte{op, 0, 0}
 	binary.LittleEndian.PutUint16(out[1:], param)
-	return out
-}
-
-func param32(op byte, param uint32) []byte {
-	out := []byte{op, 0, 0, 0, 0}
-	binary.LittleEndian.PutUint32(out[1:], param)
-	return out
-}
-
-func param64(op byte, param uint64) []byte {
-	return append([]byte{op}, param64Bytes(param)...)
-}
-
-func param64Bytes(param uint64) []byte {
-	out := make([]byte, 8)
-	binary.LittleEndian.PutUint64(out, param)
 	return out
 }
 
@@ -610,33 +575,3 @@ func ipv4TCPPacket(src, dst [4]byte, srcPort, dstPort uint16) []byte {
 	pkt[32] = 0x50
 	return pkt
 }
-
-type testIPMatcher struct {
-	locks, unlocks int
-	matchCalls     int
-	infoCalls      int
-	rules          map[uint64]bool
-	info           *sysnet.NetInfo
-}
-
-func (m *testIPMatcher) Lock() { m.locks++ }
-
-func (m *testIPMatcher) Unlock() { m.unlocks++ }
-
-func (m *testIPMatcher) Map(sysnet.Rule) uint64 { return 0 }
-
-func (m *testIPMatcher) UnMap(uint64) {}
-
-func (m *testIPMatcher) UnMapAll() {}
-
-func (m *testIPMatcher) Match(_ []byte, rule uint64) bool {
-	m.matchCalls++
-	return m.rules[rule]
-}
-
-func (m *testIPMatcher) PktInfo(_ []byte) *sysnet.NetInfo {
-	m.infoCalls++
-	return m.info
-}
-
-func (m *testIPMatcher) Close() error { return nil }

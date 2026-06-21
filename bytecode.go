@@ -66,22 +66,8 @@ const (
 	OP_PORT
 	// OP_LPORT pushes whether the local address port equals the following uint16 port.
 	OP_LPORT
-	// OP_RULE pushes whether the packet matches an IPMatcher rule.
+	// OP_RULE pushes whether the packet flow matches a sysnet rule.
 	OP_RULE
-	// OP_CGRP pushes whether IPMatcher packet info has the following cgroup id.
-	OP_CGRP
-	// OP_UID pushes whether IPMatcher packet info has the following uid.
-	OP_UID
-	// OP_GID pushes whether IPMatcher packet info has the following gid.
-	OP_GID
-	// OP_UNAME pushes whether IPMatcher packet info has the following user name.
-	OP_UNAME
-	// OP_UEXP pushes whether IPMatcher packet info user matches the following regexp.
-	OP_UEXP
-	// OP_MARK pushes whether IPMatcher packet info has the following route mark.
-	OP_MARK
-	// OP_PID pushes whether IPMatcher packet info has the following pid.
-	OP_PID
 	// OP_DIAL pushes whether the RouterCfg method is DialTCP, DialUDP, or RouteUDP.
 	OP_DIAL
 	// OP_LISTEN pushes whether the RouterCfg method is ListenTCP.
@@ -105,8 +91,6 @@ const (
 	bytecodeParamNone bytecodeParamKind = iota
 	bytecodeParamUint8
 	bytecodeParamUint16
-	bytecodeParamUint32
-	bytecodeParamUint64
 )
 
 func validateTables(
@@ -217,7 +201,7 @@ func readBytecodeParam(
 	case OP_ADDR_S, OP_LADDR_S, OP_ADDR_RE, OP_LADDR_RE,
 		OP_ADDR4, OP_LADDR4, OP_ADDR6, OP_LADDR6,
 		OP_SNET4, OP_LSNET4, OP_SNET6, OP_LSNET6,
-		OP_PORT, OP_LPORT, OP_UNAME, OP_UEXP:
+		OP_PORT, OP_LPORT, OP_RULE:
 		if *pc+1 >= len(code) {
 			return 0, bytecodeParamUint16, fmt.Errorf(
 				"%s bytecode offset %d: missing uint16 parameter",
@@ -228,28 +212,6 @@ func readBytecodeParam(
 		param := binary.LittleEndian.Uint16(code[*pc:])
 		*pc += 2
 		return uint64(param), bytecodeParamUint16, nil
-	case OP_MARK, OP_PID:
-		if *pc+3 >= len(code) {
-			return 0, bytecodeParamUint32, fmt.Errorf(
-				"%s bytecode offset %d: missing uint32 parameter",
-				name,
-				*pc-1,
-			)
-		}
-		param := binary.LittleEndian.Uint32(code[*pc:])
-		*pc += 4
-		return uint64(param), bytecodeParamUint32, nil
-	case OP_RULE, OP_CGRP, OP_UID, OP_GID:
-		if *pc+7 >= len(code) {
-			return 0, bytecodeParamUint64, fmt.Errorf(
-				"%s bytecode offset %d: missing uint64 parameter",
-				name,
-				*pc-1,
-			)
-		}
-		param := binary.LittleEndian.Uint64(code[*pc:])
-		*pc += 8
-		return param, bytecodeParamUint64, nil
 	default:
 		return 0, bytecodeParamNone, fmt.Errorf(
 			"%s bytecode offset %d: unknown opcode %d",
@@ -267,12 +229,8 @@ func readBytecodeParamUnchecked(code []byte, pc int, op byte) (uint64, int) {
 	case OP_ADDR_S, OP_LADDR_S, OP_ADDR_RE, OP_LADDR_RE,
 		OP_ADDR4, OP_LADDR4, OP_ADDR6, OP_LADDR6,
 		OP_SNET4, OP_LSNET4, OP_SNET6, OP_LSNET6,
-		OP_PORT, OP_LPORT, OP_UNAME, OP_UEXP:
+		OP_PORT, OP_LPORT, OP_RULE:
 		return uint64(binary.LittleEndian.Uint16(code[pc:])), pc + 2
-	case OP_MARK, OP_PID:
-		return uint64(binary.LittleEndian.Uint32(code[pc:])), pc + 4
-	case OP_RULE, OP_CGRP, OP_UID, OP_GID:
-		return binary.LittleEndian.Uint64(code[pc:]), pc + 8
 	default:
 		return 0, pc
 	}
@@ -575,7 +533,7 @@ func isLAddrOp(op byte) bool {
 
 func isSplitOnlyOp(op byte) bool {
 	switch op {
-	case OP_RULE, OP_CGRP, OP_UID, OP_GID, OP_UNAME, OP_UEXP, OP_MARK, OP_PID:
+	case OP_RULE:
 		return true
 	default:
 		return false
@@ -620,15 +578,4 @@ func bytecodeParamInt(param uint64, limit int) (int, bool) {
 		return 0, false
 	}
 	return int(param), true //nolint:gosec // Range checked immediately above.
-}
-
-func bytecodeParamSigned32(param uint64) (int, bool) {
-	if param > 0xffffffff {
-		return 0, false
-	}
-	//nolint:gosec // Range checked immediately above.
-	u := uint32(param)
-	//nolint:gosec // Reinterprets the validated uint32 bytecode parameter as signed int32.
-	s := int32(u)
-	return int(s), true //nolint:gosec // int32 fits in int.
 }

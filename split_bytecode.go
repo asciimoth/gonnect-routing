@@ -2,11 +2,13 @@ package routing
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
 	"regexp"
 
 	"github.com/asciimoth/gonnect"
+	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
 	"github.com/asciimoth/gonnect/tun"
 )
@@ -14,13 +16,14 @@ import (
 // SplitBytecodeRules contains the immutable tables and bytecode program used
 // to build a tun.SplitRouter.
 //
-// The packet router supports the common bytecode opcodes plus OP_RULE,
-// OP_CGRP, OP_UID, OP_GID, OP_UNAME, OP_UEXP, OP_MARK, and OP_PID. The
+// The packet router supports the common bytecode opcodes plus OP_RULE. OP_RULE
+// indexes Rules and is evaluated by a sysnet.Matcher built from System. The
 // RouterCfg method opcodes OP_DIAL, OP_LISTEN, and OP_LOOKUP are not valid for
 // packet routing. The constructor validates and copies all slices before
 // returning the router.
 type SplitBytecodeRules struct {
-	Matcher sysnet.IPMatcher
+	System sysnet.System
+	Rules  []sysnet.Rule
 
 	Strings     []string
 	Regexps     []*regexp.Regexp
@@ -35,13 +38,17 @@ type SplitBytecodeRules struct {
 type SplitRouter interface {
 	tun.SplitRouter
 	SlotReporter
+	Close() error
 }
 
-// NewBytecodeSplitRouter validates rules and returns a tun.SplitRouter that
-// evaluates stack-based bytecode against IP packets.
+// NewBytecodeSplitRouter validates rules and returns a SplitRouter that
+// evaluates stack-based bytecode against IP packets. The returned router owns
+// matchers built from rules.System; call Close when the router is no longer
+// used.
 func NewBytecodeSplitRouter(rules SplitBytecodeRules) (SplitRouter, error) {
 	cfg := &bytecodeSplitRouter{
-		matcher:     rules.Matcher,
+		system:      rules.System,
+		rules:       append([]sysnet.Rule(nil), rules.Rules...),
 		strings:     append([]string(nil), rules.Strings...),
 		regexps:     append([]*regexp.Regexp(nil), rules.Regexps...),
 		ipv4Addrs:   append([]uint32(nil), rules.IPv4Addrs...),
@@ -53,12 +60,17 @@ func NewBytecodeSplitRouter(rules SplitBytecodeRules) (SplitRouter, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	if err := cfg.buildMatchers(); err != nil {
+		return nil, err
+	}
 	cfg.mentionedSlots = mentionedBytecodeSlots(gonnect.RouterSlots, cfg.route)
 	return cfg, nil
 }
 
 type bytecodeSplitRouter struct {
-	matcher sysnet.IPMatcher
+	system   sysnet.System
+	rules    []sysnet.Rule
+	matchers []sysnet.Matcher
 
 	strings     []string
 	regexps     []*regexp.Regexp
@@ -79,12 +91,19 @@ func (cfg *bytecodeSplitRouter) MentionedSlots() []int {
 	return append([]int(nil), cfg.mentionedSlots...)
 }
 
-func (cfg *bytecodeSplitRouter) Lock() {
-	cfg.matcher.Lock()
-}
+func (cfg *bytecodeSplitRouter) Lock() {}
 
-func (cfg *bytecodeSplitRouter) Unlock() {
-	cfg.matcher.Unlock()
+func (cfg *bytecodeSplitRouter) Unlock() {}
+
+func (cfg *bytecodeSplitRouter) Close() error {
+	var err error
+	for _, matcher := range cfg.matchers {
+		if matcher != nil {
+			err = errors.Join(err, matcher.Close())
+		}
+	}
+	cfg.matchers = nil
+	return err
 }
 
 func (cfg *bytecodeSplitRouter) Route(
@@ -101,7 +120,7 @@ func (cfg *bytecodeSplitRouter) Route(
 		native:     isNative,
 		packet:     pkt,
 		packetData: buf[offset : offset+pkt.total],
-		ruleCache:  make(map[uint64]bool),
+		ruleCache:  make(map[uint16]bool),
 	}
 	stack := make([]bool, 0, 8)
 	for pc := 0; pc < len(cfg.route); {
@@ -208,46 +227,14 @@ func (cfg *bytecodeSplitRouter) Route(
 			stack = append(stack, ok && pkt.hasPorts && port == pkt.srcPort)
 		case OP_RULE:
 			stack = append(stack, ev.rule(param))
-		case OP_CGRP:
-			stack = append(stack, ev.infoField(func(info *sysnet.NetInfo) bool {
-				return info.Cgroup == param
-			}))
-		case OP_UID:
-			stack = append(stack, ev.infoField(func(info *sysnet.NetInfo) bool {
-				return info.UID == param
-			}))
-		case OP_GID:
-			stack = append(stack, ev.infoField(func(info *sysnet.NetInfo) bool {
-				return info.GID == param
-			}))
-		case OP_UNAME:
-			idx, ok := bytecodeParamIndex(param, len(cfg.strings))
-			stack = append(stack, ev.infoField(func(info *sysnet.NetInfo) bool {
-				return ok && info.User == cfg.strings[idx]
-			}))
-		case OP_UEXP:
-			idx, ok := bytecodeParamIndex(param, len(cfg.regexps))
-			stack = append(stack, ev.infoField(func(info *sysnet.NetInfo) bool {
-				return ok && cfg.regexps[idx].MatchString(info.User)
-			}))
-		case OP_MARK:
-			want, ok := bytecodeParamSigned32(param)
-			stack = append(stack, ev.infoField(func(info *sysnet.NetInfo) bool {
-				return ok && info.RouteMark == want
-			}))
-		case OP_PID:
-			want, ok := bytecodeParamSigned32(param)
-			stack = append(stack, ev.infoField(func(info *sysnet.NetInfo) bool {
-				return ok && info.PID == want
-			}))
 		}
 	}
 	return 0
 }
 
 func (cfg *bytecodeSplitRouter) validate() error {
-	if cfg.matcher == nil {
-		return fmt.Errorf("split bytecode matcher is nil")
+	if cfg.system == nil {
+		return fmt.Errorf("split bytecode system is nil")
 	}
 	for i, re := range cfg.regexps {
 		if re == nil {
@@ -262,6 +249,19 @@ func (cfg *bytecodeSplitRouter) validate() error {
 		return err
 	}
 	return validateBytecode("SplitRoute", cfg.route, cfg.validateOp)
+}
+
+func (cfg *bytecodeSplitRouter) buildMatchers() error {
+	cfg.matchers = make([]sysnet.Matcher, len(cfg.rules))
+	for i, rule := range cfg.rules {
+		matcher, err := cfg.system.BuildMatcher(rule)
+		if err != nil {
+			_ = cfg.Close()
+			return fmt.Errorf("build matcher %d: %w", i, err)
+		}
+		cfg.matchers[i] = matcher
+	}
+	return nil
 }
 
 func (cfg *bytecodeSplitRouter) validateOp(
@@ -298,11 +298,11 @@ func (cfg *bytecodeSplitRouter) validateOp(
 				param,
 			)
 		}
-	case OP_ADDR_S, OP_LADDR_S, OP_UNAME:
+	case OP_ADDR_S, OP_LADDR_S:
 		if int(param) >= len(cfg.strings) {
 			return fail("string", len(cfg.strings))
 		}
-	case OP_ADDR_RE, OP_LADDR_RE, OP_UEXP:
+	case OP_ADDR_RE, OP_LADDR_RE:
 		if int(param) >= len(cfg.regexps) {
 			return fail("regexp", len(cfg.regexps))
 		}
@@ -322,6 +322,10 @@ func (cfg *bytecodeSplitRouter) validateOp(
 		if int(param) >= len(cfg.ipv6Subnets) {
 			return fail("IPv6 subnet", len(cfg.ipv6Subnets))
 		}
+	case OP_RULE:
+		if int(param) >= len(cfg.rules) {
+			return fail("rule", len(cfg.rules))
+		}
 	}
 	return nil
 }
@@ -331,37 +335,47 @@ type splitEval struct {
 	native     bool
 	packet     parsedIPPacket
 	packetData []byte
-	ruleCache  map[uint64]bool
-	infoDone   bool
-	info       *sysnet.NetInfo
+	ruleCache  map[uint16]bool
+	flowDone   bool
+	flow       sockowner.FlowTuple
+	flowOK     bool
 }
 
 func (ev *splitEval) rule(rule uint64) bool {
 	if !ev.native {
 		return false
 	}
-	if got, ok := ev.ruleCache[rule]; ok {
+	idx, ok := bytecodeParamIndex(rule, len(ev.cfg.matchers))
+	if !ok {
+		return false
+	}
+	cacheKey := uint16(idx) //nolint:gosec // Range checked by bytecodeParamIndex.
+	if got, ok := ev.ruleCache[cacheKey]; ok {
 		return got
 	}
-	got := ev.cfg.matcher.Match(ev.packetData, rule)
-	ev.ruleCache[rule] = got
+	flow, ok := ev.packetFlow()
+	if !ok || ev.cfg.matchers[idx] == nil {
+		ev.ruleCache[cacheKey] = false
+		return false
+	}
+	got, err := ev.cfg.matchers[idx].Match(flow)
+	if err != nil {
+		got = false
+	}
+	ev.ruleCache[cacheKey] = got
 	return got
 }
 
-func (ev *splitEval) packetInfo() *sysnet.NetInfo {
-	if !ev.native {
-		return nil
+func (ev *splitEval) packetFlow() (sockowner.FlowTuple, bool) {
+	if !ev.flowDone {
+		ev.flowDone = true
+		flow, err := sockowner.FlowTupleFromOutgoingIPPacket(ev.packetData)
+		if err == nil {
+			ev.flow = flow
+			ev.flowOK = true
+		}
 	}
-	if !ev.infoDone {
-		ev.infoDone = true
-		ev.info = ev.cfg.matcher.PktInfo(ev.packetData)
-	}
-	return ev.info
-}
-
-func (ev *splitEval) infoField(match func(*sysnet.NetInfo) bool) bool {
-	info := ev.packetInfo()
-	return info != nil && match(info)
+	return ev.flow, ev.flowOK
 }
 
 type parsedIPPacket struct {

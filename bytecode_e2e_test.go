@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	"github.com/asciimoth/gonnect"
+	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
+	sysnetdebug "github.com/asciimoth/gonnect/sysnet/debug"
 	"github.com/asciimoth/gonnect/tun"
 )
 
@@ -166,25 +169,25 @@ func TestBytecodeRouterCfgE2EComplexRulesetFromLanguage(t *testing.T) {
 }
 
 func TestBytecodeSplitRouterE2EComplexRuleset(t *testing.T) {
-	matcher := &testIPMatcher{
-		rules: map[uint64]bool{99: true},
-		info: &sysnet.NetInfo{
-			Cgroup:    7,
-			UID:       1000,
-			GID:       1000,
-			User:      "alice",
-			RouteMark: -7,
-			PID:       123,
+	rule := sysnet.Rule{Type: "test", Rule: "native rule with spaces"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == rule &&
+				flow.Proto == "tcp" &&
+				flow.LocalPort == 12345 &&
+				flow.RemotePort == 443, nil
 		},
 	}
 	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
-		Matcher: matcher,
+		System: system,
+		Rules:  []sysnet.Rule{rule},
 		Strings: []string{
 			"192.0.2.2",
 			"10.0.0.1",
 			"2001:db8::2",
 			"2001:db8::1",
-			"alice",
 		},
 		Regexps: []*regexp.Regexp{
 			regexp.MustCompile(`^192\.0\.2\.`),
@@ -212,6 +215,7 @@ func TestBytecodeSplitRouterE2EComplexRuleset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
 	}
+	t.Cleanup(func() { _ = router.Close() })
 
 	backend, peer := tun.Pipe(4, 1500, 3, 5)
 	t.Cleanup(func() { _ = backend.Close() })
@@ -253,34 +257,24 @@ func TestBytecodeSplitRouterE2EComplexRuleset(t *testing.T) {
 	assertNoTunPacket(t, f2)
 	assertNoTunPacket(t, f3)
 
-	if matcher.matchCalls == 0 {
-		t.Fatal("IPMatcher.Match was not called for native packet")
-	}
-	if matcher.infoCalls == 0 {
-		t.Fatal("IPMatcher.PktInfo was not called for native packet")
-	}
-	if matcher.locks == 0 || matcher.unlocks == 0 {
-		t.Fatalf(
-			"matcher locks = %d/%d, want nonzero",
-			matcher.locks,
-			matcher.unlocks,
-		)
+	if matchCalls == 0 {
+		t.Fatal("Matcher.Match was not called for native packet")
 	}
 }
 
 func TestBytecodeSplitRouterE2EComplexRulesetFromLanguage(t *testing.T) {
-	matcher := &testIPMatcher{
-		rules: map[uint64]bool{99: true},
-		info: &sysnet.NetInfo{
-			Cgroup:    7,
-			UID:       1000,
-			GID:       1000,
-			User:      "alice",
-			RouteMark: -7,
-			PID:       123,
+	rule := sysnet.Rule{Type: "test", Rule: "native rule with spaces"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == rule &&
+				flow.Proto == "tcp" &&
+				flow.LocalPort == 12345 &&
+				flow.RemotePort == 443, nil
 		},
 	}
-	rules, err := NewSplitBytecodeRules(matcher, complexSplitRouteSrc())
+	rules, err := NewSplitBytecodeRules(system, complexSplitRouteSrc())
 	if err != nil {
 		t.Fatalf("NewSplitBytecodeRules() error = %v", err)
 	}
@@ -288,6 +282,7 @@ func TestBytecodeSplitRouterE2EComplexRulesetFromLanguage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
 	}
+	t.Cleanup(func() { _ = router.Close() })
 
 	backend, peer := tun.Pipe(4, 1500, 3, 5)
 	t.Cleanup(func() { _ = backend.Close() })
@@ -329,39 +324,29 @@ func TestBytecodeSplitRouterE2EComplexRulesetFromLanguage(t *testing.T) {
 	assertNoTunPacket(t, f2)
 	assertNoTunPacket(t, f3)
 
-	if matcher.matchCalls == 0 {
-		t.Fatal("IPMatcher.Match was not called for native packet")
-	}
-	if matcher.infoCalls == 0 {
-		t.Fatal("IPMatcher.PktInfo was not called for native packet")
-	}
-	if matcher.locks == 0 || matcher.unlocks == 0 {
-		t.Fatalf(
-			"matcher locks = %d/%d, want nonzero",
-			matcher.locks,
-			matcher.unlocks,
-		)
+	if matchCalls == 0 {
+		t.Fatal("Matcher.Match was not called for native packet")
 	}
 }
 
 func TestBytecodeSplitRouterE2ENonNativeSkipsMatcher(t *testing.T) {
-	matcher := &testIPMatcher{
-		rules: map[uint64]bool{99: true},
-		info:  &sysnet.NetInfo{UID: 1000},
+	rule := sysnet.Rule{Type: "test", Rule: "native only"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return true, nil
+		},
 	}
 	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
-		Matcher: matcher,
-		Route: append(
-			append(
-				append([]byte{OP_RULE}, param64Bytes(99)...),
-				param64(OP_UID, 1000)...,
-			),
-			OP_OR, OP_SLOT, 4,
-		),
+		System: system,
+		Rules:  []sysnet.Rule{rule},
+		Route:  append(param16(OP_RULE, 0), OP_SLOT, 4),
 	})
 	if err != nil {
 		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
 	}
+	t.Cleanup(func() { _ = router.Close() })
 
 	backend, peer := tun.Pipe(1, 1500, 0, 0)
 	t.Cleanup(func() { _ = backend.Close() })
@@ -382,11 +367,105 @@ func TestBytecodeSplitRouterE2ENonNativeSkipsMatcher(t *testing.T) {
 		2,
 	))
 	assertNoTunPacket(t, f4)
-	if matcher.matchCalls != 0 {
-		t.Fatalf("non-native Match calls = %d, want 0", matcher.matchCalls)
+	if matchCalls != 0 {
+		t.Fatalf("non-native Match calls = %d, want 0", matchCalls)
 	}
-	if matcher.infoCalls != 0 {
-		t.Fatalf("non-native PktInfo calls = %d, want 0", matcher.infoCalls)
+}
+
+func TestBytecodeSplitRouterE2EDebugSystemDefaultMatcherMatchesNoFlows(t *testing.T) {
+	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System: &sysnetdebug.System{},
+		Rules:  []sysnet.Rule{{Type: "test", Rule: "default no match"}},
+		Route: append(
+			append(param16(OP_RULE, 0), OP_SLOT, 4),
+			OP_TRUE, OP_SLOT, 5,
+		),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+
+	backend, peer := tun.Pipe(1, 1500, 0, 0)
+	t.Cleanup(func() { _ = backend.Close() })
+	t.Cleanup(func() { _ = peer.Close() })
+
+	s := tun.NewSplitter()
+	t.Cleanup(func() { _ = s.Close() })
+	s.SetRouter(router)
+	f4 := s.Get(4)
+	f5 := s.Get(5)
+	if err := s.Attach(nativeTestTun{Tun: backend}); err != nil {
+		t.Fatalf("Attach(native pipe) error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 2},
+		1,
+		2,
+	)
+	writeTunPacket(t, peer, pkt)
+	if got := readTunPacket(t, f5); !bytes.Equal(got, pkt) {
+		t.Fatalf("fallback frontend packet = %x, want %x", got, pkt)
+	}
+	assertNoTunPacket(t, f4)
+}
+
+func TestBytecodeSplitRouterE2EDebugSystemRuleMatcherErrorDropsRuleMatch(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "delegated error"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			if got != rule {
+				t.Fatalf("RuleMatcher rule = %#v, want %#v", got, rule)
+			}
+			if flow.Proto != "tcp" || flow.LocalPort != 1 || flow.RemotePort != 2 {
+				t.Fatalf("RuleMatcher flow = %#v, want tcp 1 -> 2", flow)
+			}
+			return true, errors.New("debug matcher failed")
+		},
+	}
+	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System: system,
+		Rules:  []sysnet.Rule{rule},
+		Route: append(
+			append(param16(OP_RULE, 0), OP_SLOT, 4),
+			OP_TRUE, OP_SLOT, 5,
+		),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+
+	backend, peer := tun.Pipe(1, 1500, 0, 0)
+	t.Cleanup(func() { _ = backend.Close() })
+	t.Cleanup(func() { _ = peer.Close() })
+
+	s := tun.NewSplitter()
+	t.Cleanup(func() { _ = s.Close() })
+	s.SetRouter(router)
+	f4 := s.Get(4)
+	f5 := s.Get(5)
+	if err := s.Attach(nativeTestTun{Tun: backend}); err != nil {
+		t.Fatalf("Attach(native pipe) error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 2},
+		1,
+		2,
+	)
+	writeTunPacket(t, peer, pkt)
+	if got := readTunPacket(t, f5); !bytes.Equal(got, pkt) {
+		t.Fatalf("fallback frontend packet = %x, want %x", got, pkt)
+	}
+	assertNoTunPacket(t, f4)
+	if matchCalls != 1 {
+		t.Fatalf("RuleMatcher calls = %d, want 1", matchCalls)
 	}
 }
 
@@ -493,15 +572,8 @@ func complexSplitRoute() []byte {
 		param16(OP_LSNET4, 1),
 		param16(OP_PORT, 443),
 		param16(OP_LPORT, 12345),
-		param64(OP_RULE, 99),
-		param64(OP_RULE, 99),
-		param64(OP_CGRP, 7),
-		param64(OP_UID, 1000),
-		param64(OP_GID, 1000),
-		param16(OP_UNAME, 4),
-		param16(OP_UEXP, 3),
-		param32(OP_MARK, ^uint32(6)),
-		param32(OP_PID, 123),
+		param16(OP_RULE, 0),
+		param16(OP_RULE, 0),
 	), 2)...)
 	code = append(code, slotWhen(andAll(
 		[]byte{OP_NET6},
@@ -695,23 +767,7 @@ PORT 443
 AND
 LPORT 12345
 AND
-RULE 99
-AND
-RULE 99
-AND
-CGRP 7
-AND
-UID 1000
-AND
-GID 1000
-AND
-UNAME alice
-AND
-UEXP ^ali
-AND
-MARK -7
-AND
-PID 123
+RULE test native rule with spaces
 AND
 SLOT 2
 NET6

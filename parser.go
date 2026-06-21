@@ -92,9 +92,16 @@ func NewBytecodeRulesProgram(program string) (BytecodeRules, error) {
 	return rules, nil
 }
 
-// NewSplitBytecodeRules parses the simple routing rules language into SplitBytecodeRules.
+// NewSplitBytecodeRules parses the simple routing rules language into
+// SplitBytecodeRules. RULE takes a sysnet rule type followed by the rule text:
+//
+//	RULE app org.example.App
+//
+// The first field after RULE becomes sysnet.Rule.Type. Everything after the
+// separating space or tab becomes sysnet.Rule.Rule verbatim, so rule text may
+// contain spaces and tabs.
 func NewSplitBytecodeRules(
-	matcher sysnet.IPMatcher,
+	system sysnet.System,
 	route string,
 ) (SplitBytecodeRules, error) {
 	p := newBytecodeParser()
@@ -102,7 +109,7 @@ func NewSplitBytecodeRules(
 	if err != nil {
 		return SplitBytecodeRules{}, err
 	}
-	rules := SplitBytecodeRules{Matcher: matcher, Route: code}
+	rules := SplitBytecodeRules{System: system, Route: code}
 	p.applySplit(&rules)
 	if _, err := NewBytecodeSplitRouter(rules); err != nil {
 		return SplitBytecodeRules{}, err
@@ -123,6 +130,8 @@ type bytecodeParser struct {
 	ipv6Index    map[netip.Addr]uint16
 	ipv6Subnets  []netip.Prefix
 	ipv6NetIndex map[netip.Prefix]uint16
+	rules        []sysnet.Rule
+	ruleIndex    map[sysnet.Rule]uint16
 }
 
 func newBytecodeParser() *bytecodeParser {
@@ -133,6 +142,7 @@ func newBytecodeParser() *bytecodeParser {
 		ipv4NetIndex: make(map[IPv4Subnet]uint16),
 		ipv6Index:    make(map[netip.Addr]uint16),
 		ipv6NetIndex: make(map[netip.Prefix]uint16),
+		ruleIndex:    make(map[sysnet.Rule]uint16),
 	}
 }
 
@@ -152,6 +162,7 @@ func (p *bytecodeParser) applySplit(rules *SplitBytecodeRules) {
 	rules.IPv4Subnets = append([]IPv4Subnet(nil), p.ipv4Subnets...)
 	rules.IPv6Addrs = append([]netip.Addr(nil), p.ipv6Addrs...)
 	rules.IPv6Subnets = append([]netip.Prefix(nil), p.ipv6Subnets...)
+	rules.Rules = append([]sysnet.Rule(nil), p.rules...)
 }
 
 func (p *bytecodeParser) parseProgram(name, src string) ([]byte, error) {
@@ -380,13 +391,13 @@ func (p *bytecodeParser) appendOp(
 			return nil, err
 		}
 		return append(code, op, byte(v)), nil
-	case OP_ADDR_S, OP_LADDR_S, OP_UNAME:
+	case OP_ADDR_S, OP_LADDR_S:
 		idx, err := p.stringParam(op, arg, hasArg)
 		if err != nil {
 			return nil, err
 		}
 		return appendParam16(code, op, idx), nil
-	case OP_ADDR_RE, OP_LADDR_RE, OP_UEXP:
+	case OP_ADDR_RE, OP_LADDR_RE:
 		idx, err := p.regexpParam(op, arg, hasArg)
 		if err != nil {
 			return nil, err
@@ -426,24 +437,12 @@ func (p *bytecodeParser) appendOp(
 			return nil, err
 		}
 		return appendParam16(code, op, param), nil
-	case OP_MARK:
-		v, err := parseMarkArg(op, arg, hasArg)
+	case OP_RULE:
+		idx, err := p.ruleParam(op, arg, hasArg)
 		if err != nil {
 			return nil, err
 		}
-		return appendParam32(code, op, v), nil
-	case OP_PID:
-		v, err := parseInt32Arg(op, arg, hasArg)
-		if err != nil {
-			return nil, err
-		}
-		return appendParam32(code, op, v), nil
-	case OP_RULE, OP_CGRP, OP_UID, OP_GID:
-		v, err := parseUintArg(op, arg, hasArg, 64)
-		if err != nil {
-			return nil, err
-		}
-		return appendParam64(code, op, v), nil
+		return appendParam16(code, op, idx), nil
 	default:
 		return nil, fmt.Errorf("unknown opcode %d", op)
 	}
@@ -619,6 +618,50 @@ func (p *bytecodeParser) ipv6SubnetParam(
 	return idx, nil
 }
 
+func (p *bytecodeParser) ruleParam(
+	op byte,
+	arg string,
+	hasArg bool,
+) (uint16, error) {
+	arg, err := requiredTextArg(op, arg, hasArg)
+	if err != nil {
+		return 0, err
+	}
+	ruleType, rule, ok := splitRuleParam(arg)
+	if !ok {
+		return 0, fmt.Errorf(
+			"operation %s requires a rule type and rule text",
+			bytecodeName(op),
+		)
+	}
+	entry := sysnet.Rule{Type: ruleType, Rule: rule}
+	if idx, ok := p.ruleIndex[entry]; ok {
+		return idx, nil
+	}
+	idx, err := nextTableIndex(bytecodeName(op), len(p.rules))
+	if err != nil {
+		return 0, err
+	}
+	p.rules = append(p.rules, entry)
+	p.ruleIndex[entry] = idx
+	return idx, nil
+}
+
+func splitRuleParam(arg string) (ruleType, rule string, ok bool) {
+	arg = strings.TrimLeft(arg, " \t")
+	if arg == "" {
+		return "", "", false
+	}
+	for i, r := range arg {
+		if r == ' ' || r == '\t' {
+			ruleType = arg[:i]
+			rule = arg[i+1:]
+			return ruleType, rule, ruleType != ""
+		}
+	}
+	return "", "", false
+}
+
 func requiredTextArg(op byte, arg string, hasArg bool) (string, error) {
 	if !hasArg || arg == "" {
 		return "", fmt.Errorf(
@@ -669,77 +712,9 @@ func checkedUint16(name string, v uint64) (uint16, error) {
 	return uint16(v), nil //nolint:gosec // Range checked immediately above.
 }
 
-func parseInt32Arg(op byte, arg string, hasArg bool) (uint32, error) {
-	if !hasArg || strings.TrimSpace(arg) == "" {
-		return 0, fmt.Errorf(
-			"operation %s requires an argument",
-			bytecodeName(op),
-		)
-	}
-	text := strings.TrimSpace(arg)
-	if strings.HasPrefix(text, "-") {
-		v, err := strconv.ParseInt(text, 10, 32)
-		if err != nil {
-			return 0, fmt.Errorf(
-				"invalid %s argument %q: %w",
-				bytecodeName(op),
-				arg,
-				err,
-			)
-		}
-		//nolint:gosec // ParseInt with bitSize 32 guarantees int32 range; conversion preserves bytecode representation.
-		return uint32(v), nil
-	}
-	v, err := strconv.ParseUint(text, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf(
-			"invalid %s argument %q: %w",
-			bytecodeName(op),
-			arg,
-			err,
-		)
-	}
-	return uint32(v), nil
-}
-
-func parseMarkArg(op byte, arg string, hasArg bool) (uint32, error) {
-	if !hasArg || strings.TrimSpace(arg) == "" {
-		return 0, fmt.Errorf(
-			"operation %s requires an argument",
-			bytecodeName(op),
-		)
-	}
-	text := strings.TrimSpace(arg)
-	if strings.HasPrefix(text, "0x") || strings.HasPrefix(text, "0X") {
-		v, err := strconv.ParseUint(text, 0, 32)
-		if err != nil {
-			return 0, fmt.Errorf(
-				"invalid %s argument %q: %w",
-				bytecodeName(op),
-				arg,
-				err,
-			)
-		}
-		return uint32(v), nil
-	}
-	return parseInt32Arg(op, arg, hasArg)
-}
-
 func appendParam16(code []byte, op byte, param uint16) []byte {
 	code = append(code, op, 0, 0)
 	binary.LittleEndian.PutUint16(code[len(code)-2:], param)
-	return code
-}
-
-func appendParam32(code []byte, op byte, param uint32) []byte {
-	code = append(code, op, 0, 0, 0, 0)
-	binary.LittleEndian.PutUint32(code[len(code)-4:], param)
-	return code
-}
-
-func appendParam64(code []byte, op byte, param uint64) []byte {
-	code = append(code, op, 0, 0, 0, 0, 0, 0, 0, 0)
-	binary.LittleEndian.PutUint64(code[len(code)-8:], param)
 	return code
 }
 
@@ -781,13 +756,6 @@ var bytecodeOpByName = map[string]byte{
 	"PORT":     OP_PORT,
 	"LPORT":    OP_LPORT,
 	"RULE":     OP_RULE,
-	"CGRP":     OP_CGRP,
-	"UID":      OP_UID,
-	"GID":      OP_GID,
-	"UNAME":    OP_UNAME,
-	"UEXP":     OP_UEXP,
-	"MARK":     OP_MARK,
-	"PID":      OP_PID,
 	"DIAL":     OP_DIAL,
 	"LISTEN":   OP_LISTEN,
 	"LOOKUP":   OP_LOOKUP,

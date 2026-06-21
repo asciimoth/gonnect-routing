@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/asciimoth/gonnect/sysnet"
+	sysnetdebug "github.com/asciimoth/gonnect/sysnet/debug"
 )
 
 func TestNewBytecodeRulesParsesProgramsAndDeduplicatesResources(t *testing.T) {
@@ -351,7 +354,7 @@ func TestNewBytecodeRulesRejectsOPPrefix(t *testing.T) {
 }
 
 func TestNewBytecodeRulesRejectsSplitOnlyOps(t *testing.T) {
-	_, err := NewBytecodeRules("RULE 1\n", "", "", "", "")
+	_, err := NewBytecodeRules("RULE test value\n", "", "", "", "")
 	if err == nil || !strings.Contains(err.Error(), "not valid for RouterCfg") {
 		t.Fatalf(
 			"NewBytecodeRules() error = %v, want RouterCfg validation error",
@@ -361,50 +364,54 @@ func TestNewBytecodeRulesRejectsSplitOnlyOps(t *testing.T) {
 }
 
 func TestNewSplitBytecodeRulesParsesSplitOnlyOps(t *testing.T) {
-	rules, err := NewSplitBytecodeRules(&testIPMatcher{}, `
-rule 99
-RULE 99
+	rules, err := NewSplitBytecodeRules(&sysnetdebug.System{}, `
+rule test arbitrary text
+RULE test arbitrary text
 AND
-UNAME alice
-UEXP ^ali
-AND
-MARK -7
-AND
-OR
 SLOT 3
 `)
 	if err != nil {
 		t.Fatalf("NewSplitBytecodeRules() error = %v", err)
 	}
-	if got, want := rules.Strings, []string{
-		"alice",
-	}; !stringSlicesEqual(
-		got,
-		want,
-	) {
-		t.Fatalf("Strings = %#v, want %#v", got, want)
+	if got, want := rules.Rules, []sysnet.Rule{
+		{Type: "test", Rule: "arbitrary text"},
+	}; !reflectRulesEqual(got, want) {
+		t.Fatalf("Rules = %#v, want %#v", got, want)
 	}
-	if len(rules.Regexps) != 1 || rules.Regexps[0].String() != `^ali` {
-		t.Fatalf("Regexps = %#v, want one ^ali regexp", rules.Regexps)
+	if !bytes.Equal(
+		rules.Route,
+		append(
+			append(param16(OP_RULE, 0), param16(OP_RULE, 0)...),
+			OP_AND, OP_SLOT, 3,
+		),
+	) {
+		t.Fatalf("Route bytecode = %#v", rules.Route)
 	}
 }
 
-func TestNewSplitBytecodeRulesParsesHexMarkAsRawUint32(t *testing.T) {
-	rules, err := NewSplitBytecodeRules(&testIPMatcher{}, `
-MARK 0x0111010
-SLOT 3
-`)
+func TestNewSplitBytecodeRulesPreservesRuleTextWhitespace(t *testing.T) {
+	rules, err := NewSplitBytecodeRules(&sysnetdebug.System{}, "RULE app value  with\tspaces\nSLOT 3\n")
 	if err != nil {
 		t.Fatalf("NewSplitBytecodeRules() error = %v", err)
 	}
-	want := append(param32(OP_MARK, 0x0111010), OP_SLOT, 3)
-	if !bytes.Equal(rules.Route, want) {
-		t.Fatalf("Route bytecode = %#v, want %#v", rules.Route, want)
+	want := []sysnet.Rule{{Type: "app", Rule: "value  with\tspaces"}}
+	if !reflectRulesEqual(rules.Rules, want) {
+		t.Fatalf("Rules = %#v, want %#v", rules.Rules, want)
+	}
+}
+
+func TestNewSplitBytecodeRulesRejectsRuleWithoutText(t *testing.T) {
+	_, err := NewSplitBytecodeRules(&sysnetdebug.System{}, `
+RULE app
+SLOT 3
+`)
+	if err == nil || !strings.Contains(err.Error(), "requires a rule type and rule text") {
+		t.Fatalf("NewSplitBytecodeRules() error = %v, want rule text error", err)
 	}
 }
 
 func TestNewSplitBytecodeRulesRejectsRouterMethodOps(t *testing.T) {
-	_, err := NewSplitBytecodeRules(&testIPMatcher{}, "DIAL\nSLOT 1\n")
+	_, err := NewSplitBytecodeRules(&sysnetdebug.System{}, "DIAL\nSLOT 1\n")
 	if err == nil || !strings.Contains(err.Error(), "not valid for SplitRouter") {
 		t.Fatalf(
 			"NewSplitBytecodeRules() error = %v, want SplitRouter validation error",
@@ -414,6 +421,18 @@ func TestNewSplitBytecodeRulesRejectsRouterMethodOps(t *testing.T) {
 }
 
 func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func reflectRulesEqual(a, b []sysnet.Rule) bool {
 	if len(a) != len(b) {
 		return false
 	}
