@@ -3,12 +3,14 @@ package routing
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"reflect"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
@@ -463,6 +465,577 @@ func TestBytecodeSplitRouterMatcherCaching(t *testing.T) {
 	}
 }
 
+func TestBytecodeSplitRouterShortCircuitsRuleGuards(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "guarded rule"}
+	pkt := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 2},
+		1,
+		2,
+	)
+	tests := []struct {
+		name string
+		code []byte
+		want int
+	}{
+		{
+			name: "false and guard",
+			code: slotWhen(andAll(
+				[]byte{OP_TCP},
+				param16(OP_ADDR4, 0),
+				param16(OP_RULE, 0),
+			), 8),
+			want: 0,
+		},
+		{
+			name: "true or guard",
+			code: slotWhen(orOp(
+				[]byte{OP_TCP},
+				param16(OP_RULE, 0),
+			), 8),
+			want: 8,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var matchCalls int
+			cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+				System: &sysnetdebug.System{
+					RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+						matchCalls++
+						return true, nil
+					},
+				},
+				Rules:         []sysnet.Rule{rule},
+				IPv4Addrs:     []uint32{ip4(203, 0, 113, 1)},
+				RuleCacheTTL:  -1,
+				RouteCacheTTL: -1,
+				Route:         tt.code,
+			})
+			if err != nil {
+				t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+			}
+			if got := cfg.Route(pkt, 0, true); got != tt.want {
+				t.Fatalf("Route() = %d, want %d", got, tt.want)
+			}
+			if matchCalls != 0 {
+				t.Fatalf("Match calls = %d, want 0", matchCalls)
+			}
+		})
+	}
+}
+
+func TestBytecodeSplitRouterMatcherCachesRepeatedFlow(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "cached flow"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == rule &&
+				flow.Proto == "tcp" &&
+				flow.LocalPort == 1 &&
+				flow.RemotePort == 2, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:       system,
+		Rules:        []sysnet.Rule{rule},
+		RuleCacheTTL: time.Minute,
+		Route:        append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	for i := 0; i < 2; i++ {
+		if got := cfg.Route(pkt, 0, true); got != 8 {
+			t.Fatalf("Route(%d) = %d, want 8", i, got)
+		}
+	}
+	if matchCalls != 1 {
+		t.Fatalf("Match calls = %d, want 1", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterMatcherCachesFalseResults(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "cached miss"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return false, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         []sysnet.Rule{rule},
+		RuleCacheTTL:  time.Minute,
+		RouteCacheTTL: -1,
+		Route:         append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	for i := 0; i < 2; i++ {
+		if got := cfg.Route(pkt, 0, true); got != 0 {
+			t.Fatalf("Route(%d) = %d, want 0", i, got)
+		}
+	}
+	if matchCalls != 1 {
+		t.Fatalf("Match calls = %d, want 1", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterMatcherCacheDoesNotCacheErrors(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "flaky matcher"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			if matchCalls == 1 {
+				return false, errors.New("temporary matcher failure")
+			}
+			return true, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         []sysnet.Rule{rule},
+		RuleCacheTTL:  time.Minute,
+		RouteCacheTTL: -1,
+		Route:         append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	if got := cfg.Route(pkt, 0, true); got != 0 {
+		t.Fatalf("Route(first) = %d, want 0", got)
+	}
+	if got := cfg.Route(pkt, 0, true); got != 8 {
+		t.Fatalf("Route(second) = %d, want 8", got)
+	}
+	if got := cfg.Route(pkt, 0, true); got != 8 {
+		t.Fatalf("Route(third) = %d, want 8", got)
+	}
+	if matchCalls != 2 {
+		t.Fatalf("Match calls = %d, want 2", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterMatcherCacheKeyIncludesProtocol(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "protocol scoped"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == rule && flow.Proto == "tcp", nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         []sysnet.Rule{rule},
+		RuleCacheTTL:  time.Minute,
+		RouteCacheTTL: -1,
+		Route:         append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	src := [4]byte{10, 0, 0, 1}
+	dst := [4]byte{192, 0, 2, 2}
+	tcp := ipv4TCPPacket(src, dst, 1, 2)
+	udp := ipv4UDPPacket(src, dst, 1, 2)
+	if got := cfg.Route(tcp, 0, true); got != 8 {
+		t.Fatalf("Route(tcp first) = %d, want 8", got)
+	}
+	if got := cfg.Route(udp, 0, true); got != 0 {
+		t.Fatalf("Route(udp) = %d, want 0", got)
+	}
+	if got := cfg.Route(tcp, 0, true); got != 8 {
+		t.Fatalf("Route(tcp second) = %d, want 8", got)
+	}
+	if matchCalls != 2 {
+		t.Fatalf("Match calls = %d, want 2", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterDedupesRuleIndexesAboveMask(t *testing.T) {
+	target := sysnet.Rule{Type: "test", Rule: "rule 64"}
+	rules := make([]sysnet.Rule, 65)
+	rules[64] = target
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == target &&
+				flow.Proto == "tcp" &&
+				flow.LocalPort == 1 &&
+				flow.RemotePort == 2, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         rules,
+		RuleCacheTTL:  -1,
+		RouteCacheTTL: -1,
+		Route: slotWhen(andAll(
+			param16(OP_RULE, 64),
+			param16(OP_RULE, 64),
+		), 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	if got := cfg.Route(pkt, 0, true); got != 8 {
+		t.Fatalf("Route() = %d, want 8", got)
+	}
+	if matchCalls != 1 {
+		t.Fatalf("Match calls = %d, want 1", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterMatcherCacheExpires(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "short cache"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == rule &&
+				flow.Proto == "tcp" &&
+				flow.LocalPort == 1 &&
+				flow.RemotePort == 2, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:       system,
+		Rules:        []sysnet.Rule{rule},
+		RuleCacheTTL: time.Nanosecond,
+		Route:        append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	if got := cfg.Route(pkt, 0, true); got != 8 {
+		t.Fatalf("Route(first) = %d, want 8", got)
+	}
+	time.Sleep(time.Millisecond)
+	if got := cfg.Route(pkt, 0, true); got != 8 {
+		t.Fatalf("Route(second) = %d, want 8", got)
+	}
+	if matchCalls != 2 {
+		t.Fatalf("Match calls = %d, want 2", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterMatcherCacheKeyIncludesFlow(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "per flow"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == rule &&
+				flow.Proto == "tcp" &&
+				flow.RemotePort == 2, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:       system,
+		Rules:        []sysnet.Rule{rule},
+		RuleCacheTTL: time.Minute,
+		Route:        append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt1 := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	pkt2 := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 3, 2)
+	if got := cfg.Route(pkt1, 0, true); got != 8 {
+		t.Fatalf("Route(pkt1) = %d, want 8", got)
+	}
+	if got := cfg.Route(pkt2, 0, true); got != 8 {
+		t.Fatalf("Route(pkt2) = %d, want 8", got)
+	}
+	if matchCalls != 2 {
+		t.Fatalf("Match calls = %d, want 2", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterRouteCacheCachesWholeEvaluation(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "cached route"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(got sysnet.Rule, flow sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return got == rule &&
+				flow.Proto == "tcp" &&
+				flow.LocalPort == 1 &&
+				flow.RemotePort == 2, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         []sysnet.Rule{rule},
+		RuleCacheTTL:  -1,
+		RouteCacheTTL: time.Minute,
+		Route:         append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	for i := 0; i < 2; i++ {
+		if got := cfg.Route(pkt, 0, true); got != 8 {
+			t.Fatalf("Route(%d) = %d, want 8", i, got)
+		}
+	}
+	if matchCalls != 1 {
+		t.Fatalf("Match calls = %d, want 1", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterRouteCacheFollowsRuleCacheDisable(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "uncached route"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return true, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:       system,
+		Rules:        []sysnet.Rule{rule},
+		RuleCacheTTL: -1,
+		Route:        append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	for i := 0; i < 2; i++ {
+		if got := cfg.Route(pkt, 0, true); got != 8 {
+			t.Fatalf("Route(%d) = %d, want 8", i, got)
+		}
+	}
+	if matchCalls != 2 {
+		t.Fatalf("Match calls = %d, want 2", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterRouteCacheDoesNotCacheMatcherErrors(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "flaky route"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			if matchCalls == 1 {
+				return false, errors.New("temporary matcher failure")
+			}
+			return true, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         []sysnet.Rule{rule},
+		RuleCacheTTL:  -1,
+		RouteCacheTTL: time.Minute,
+		Route:         append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	if got := cfg.Route(pkt, 0, true); got != 0 {
+		t.Fatalf("Route(first) = %d, want 0", got)
+	}
+	if got := cfg.Route(pkt, 0, true); got != 8 {
+		t.Fatalf("Route(second) = %d, want 8", got)
+	}
+	if matchCalls != 2 {
+		t.Fatalf("Match calls = %d, want 2", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterRouteCacheKeyIncludesNativeState(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "native route"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return true, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         []sysnet.Rule{rule},
+		RuleCacheTTL:  -1,
+		RouteCacheTTL: time.Minute,
+		Route:         append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	pkt := ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2)
+	if got := cfg.Route(pkt, 0, false); got != 0 {
+		t.Fatalf("Route(non-native) = %d, want 0", got)
+	}
+	if got := cfg.Route(pkt, 0, true); got != 8 {
+		t.Fatalf("Route(native first) = %d, want 8", got)
+	}
+	if got := cfg.Route(pkt, 0, true); got != 8 {
+		t.Fatalf("Route(native second) = %d, want 8", got)
+	}
+	if matchCalls != 1 {
+		t.Fatalf("Match calls = %d, want 1", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterRouteCacheKeyIncludesFlowEligibility(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "well formed flow"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return true, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         []sysnet.Rule{rule},
+		RuleCacheTTL:  -1,
+		RouteCacheTTL: time.Minute,
+		Route:         append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	src := [4]byte{10, 0, 0, 1}
+	dst := [4]byte{192, 0, 2, 2}
+	valid := ipv4TCPPacket(src, dst, 1, 2)
+	malformed := ipv4ShortTCPPacket(src, dst, 1, 2)
+	if got := cfg.Route(valid, 0, true); got != 8 {
+		t.Fatalf("Route(valid first) = %d, want 8", got)
+	}
+	if got := cfg.Route(malformed, 0, true); got != 0 {
+		t.Fatalf("Route(malformed) = %d, want 0", got)
+	}
+	if got := cfg.Route(valid, 0, true); got != 8 {
+		t.Fatalf("Route(valid second) = %d, want 8", got)
+	}
+	if matchCalls != 1 {
+		t.Fatalf("Match calls = %d, want 1", matchCalls)
+	}
+}
+
+func TestBytecodeSplitRouterRouteCacheKeyIncludesPortsPresentState(t *testing.T) {
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        &sysnetdebug.System{},
+		RouteCacheTTL: time.Minute,
+		Route:         append(param16(OP_PORT, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	src := [4]byte{10, 0, 0, 1}
+	dst := [4]byte{192, 0, 2, 2}
+	valid := ipv4TCPPacket(src, dst, 0, 0)
+	noPorts := ipv4HeaderOnlyPacket(src, dst, 6)
+	if got := cfg.Route(valid, 0, true); got != 8 {
+		t.Fatalf("Route(valid first) = %d, want 8", got)
+	}
+	if got := cfg.Route(noPorts, 0, true); got != 0 {
+		t.Fatalf("Route(no ports) = %d, want 0", got)
+	}
+	if got := cfg.Route(valid, 0, true); got != 8 {
+		t.Fatalf("Route(valid second) = %d, want 8", got)
+	}
+}
+
+func TestBytecodeSplitRouterRouteCacheKeyIncludesProtocol(t *testing.T) {
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        &sysnetdebug.System{},
+		RouteCacheTTL: time.Minute,
+		Route:         append([]byte{OP_TCP}, OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	src := [4]byte{10, 0, 0, 1}
+	dst := [4]byte{192, 0, 2, 2}
+	tcp := ipv4TCPPacket(src, dst, 1, 2)
+	udp := ipv4UDPPacket(src, dst, 1, 2)
+	if got := cfg.Route(tcp, 0, true); got != 8 {
+		t.Fatalf("Route(tcp first) = %d, want 8", got)
+	}
+	if got := cfg.Route(udp, 0, true); got != 0 {
+		t.Fatalf("Route(udp) = %d, want 0", got)
+	}
+	if got := cfg.Route(tcp, 0, true); got != 8 {
+		t.Fatalf("Route(tcp second) = %d, want 8", got)
+	}
+}
+
+func TestBytecodeSplitRouterSkipsMatcherForPacketsWithoutFlows(t *testing.T) {
+	rule := sysnet.Rule{Type: "test", Rule: "flow only"}
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return true, nil
+		},
+	}
+	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:        system,
+		Rules:         []sysnet.Rule{rule},
+		RuleCacheTTL:  -1,
+		RouteCacheTTL: -1,
+		Route:         append(param16(OP_RULE, 0), OP_SLOT, 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+
+	src := [4]byte{10, 0, 0, 1}
+	dst := [4]byte{192, 0, 2, 2}
+	tests := []struct {
+		name string
+		pkt  []byte
+	}{
+		{name: "short IPv4", pkt: []byte{0x45}},
+		{name: "TCP without ports", pkt: ipv4HeaderOnlyPacket(src, dst, 6)},
+		{name: "UDP without ports", pkt: ipv4HeaderOnlyPacket(src, dst, 17)},
+		{name: "ICMP", pkt: ipv4HeaderOnlyPacket(src, dst, 1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cfg.Route(tt.pkt, 0, true); got != 0 {
+				t.Fatalf("Route() = %d, want 0", got)
+			}
+		})
+	}
+	if matchCalls != 0 {
+		t.Fatalf("Match calls = %d, want 0", matchCalls)
+	}
+}
+
 func TestBytecodeSplitRouterSkipsMatcherForNonNativePackets(t *testing.T) {
 	rule := sysnet.Rule{Type: "test", Rule: "native only"}
 	var matchCalls int
@@ -573,5 +1146,43 @@ func ipv4TCPPacket(src, dst [4]byte, srcPort, dstPort uint16) []byte {
 	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
 	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
 	pkt[32] = 0x50
+	return pkt
+}
+
+func ipv4UDPPacket(src, dst [4]byte, srcPort, dstPort uint16) []byte {
+	pkt := make([]byte, 28)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
+	pkt[8] = 64
+	pkt[9] = 17
+	copy(pkt[12:16], src[:])
+	copy(pkt[16:20], dst[:])
+	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
+	binary.BigEndian.PutUint16(pkt[24:26], 8)
+	return pkt
+}
+
+func ipv4HeaderOnlyPacket(src, dst [4]byte, proto uint8) []byte {
+	pkt := make([]byte, 20)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
+	pkt[8] = 64
+	pkt[9] = proto
+	copy(pkt[12:16], src[:])
+	copy(pkt[16:20], dst[:])
+	return pkt
+}
+
+func ipv4ShortTCPPacket(src, dst [4]byte, srcPort, dstPort uint16) []byte {
+	pkt := make([]byte, 24)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
+	pkt[8] = 64
+	pkt[9] = 6
+	copy(pkt[12:16], src[:])
+	copy(pkt[16:20], dst[:])
+	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
 	return pkt
 }
