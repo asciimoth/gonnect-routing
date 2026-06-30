@@ -253,6 +253,14 @@ func TestNewBytecodeRulesProgramReportsParseAndValidationErrors(t *testing.T) {
 			err,
 		)
 	}
+
+	_, err = NewBytecodeRulesProgram("TRUE\nSLOT 1\nTRUE\nOR\nSLOT 2\n")
+	if err == nil || !strings.Contains(err.Error(), "stack underflow") {
+		t.Fatalf(
+			"NewBytecodeRulesProgram() validation error = %v, want stack underflow",
+			err,
+		)
+	}
 }
 
 func TestBytecodeSegmentCanTriggerKeepsMalformedSegments(t *testing.T) {
@@ -415,6 +423,23 @@ func TestNewSplitBytecodeRulesRejectsRouterMethodOps(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not valid for SplitRouter") {
 		t.Fatalf(
 			"NewSplitBytecodeRules() error = %v, want SplitRouter validation error",
+			err,
+		)
+	}
+}
+
+func TestNewSplitBytecodeRulesRejectsStackUnderflowAfterTerminalSegment(t *testing.T) {
+	_, err := NewSplitBytecodeRules(&sysnetdebug.System{}, `
+TRUE
+SLOT 1
+
+RULE cmd chrome
+OR
+SLOT 2
+`)
+	if err == nil || !strings.Contains(err.Error(), "stack underflow") {
+		t.Fatalf(
+			"NewSplitBytecodeRules() error = %v, want stack underflow",
 			err,
 		)
 	}

@@ -325,6 +325,13 @@ func TestBytecodeRouterCfgValidation(t *testing.T) {
 			want: "stack underflow",
 		},
 		{
+			name: "stack underflow after terminal segment",
+			rules: BytecodeRules{
+				DialTCP: []byte{OP_TRUE, OP_SLOT, 1, OP_OR},
+			},
+			want: "stack underflow",
+		},
+		{
 			name: "lookup laddr op",
 			rules: BytecodeRules{
 				Lookup: []byte{OP_LFQDN},
@@ -386,6 +393,19 @@ func TestBytecodeRouterCfgValidation(t *testing.T) {
 	}
 }
 
+func TestBytecodeRouterCfgReusesStackAfterTerminalFallthrough(t *testing.T) {
+	cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+		DialTCP: []byte{OP_TRUE, OP_FALSE, OP_SLOT, 1, OP_SLOT, 2},
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+	}
+
+	if got := cfg.DialTCP("tcp", "", "example.com:443"); got != 2 {
+		t.Fatalf("DialTCP() = %d, want 2", got)
+	}
+}
+
 func TestBytecodeSplitRouterRoutesPackets(t *testing.T) {
 	cfg, err := NewBytecodeSplitRouter(SplitBytecodeRules{
 		System:    &sysnetdebug.System{},
@@ -420,6 +440,25 @@ func TestBytecodeSplitRouterRoutesPackets(t *testing.T) {
 	}
 	if got := cfg.Route(buf[:3], 3, false); got != 0 {
 		t.Fatalf("Route(malformed) = %d, want 0", got)
+	}
+}
+
+func TestBytecodeSplitRouterFallbackReusesStackAfterTerminalFallthrough(t *testing.T) {
+	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System: &sysnetdebug.System{},
+		Route:  []byte{OP_TRUE, OP_FALSE, OP_SLOT, 1, OP_SLOT, 2},
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+
+	if got := router.Route(
+		ipv4TCPPacket([4]byte{10, 0, 0, 1}, [4]byte{192, 0, 2, 2}, 1, 2),
+		0,
+		false,
+	); got != 2 {
+		t.Fatalf("Route() = %d, want 2", got)
 	}
 }
 
@@ -1094,34 +1133,79 @@ func TestBytecodeSplitRouterReportsMentionedSlots(t *testing.T) {
 }
 
 func TestBytecodeSplitRouterValidation(t *testing.T) {
-	_, err := NewBytecodeSplitRouter(SplitBytecodeRules{
-		System: &sysnetdebug.System{},
-		Route:  param16(OP_RULE, 0),
-	})
-	if err == nil ||
-		!strings.Contains(err.Error(), "rule index 0 out of range 0") {
-		t.Fatalf(
-			"NewBytecodeSplitRouter() error = %v, want rule index error",
-			err,
-		)
+	tests := []struct {
+		name  string
+		rules SplitBytecodeRules
+		want  string
+	}{
+		{
+			name: "rule index",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Route:  param16(OP_RULE, 0),
+			},
+			want: "rule index 0 out of range 0",
+		},
+		{
+			name: "method op",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Route:  []byte{OP_DIAL, OP_SLOT, 1},
+			},
+			want: "not valid for SplitRouter",
+		},
+		{
+			name:  "nil system",
+			rules: SplitBytecodeRules{},
+			want:  "system is nil",
+		},
+		{
+			name: "terminal underflow after terminal segment",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Route:  []byte{OP_TRUE, OP_SLOT, 1, OP_SLOT, 2},
+			},
+			want: "stack underflow",
+		},
+		{
+			name: "not underflow after terminal segment",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Route:  []byte{OP_TRUE, OP_SLOT, 1, OP_NOT},
+			},
+			want: "stack underflow",
+		},
+		{
+			name: "and underflow after terminal segment",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Route:  []byte{OP_TRUE, OP_SLOT, 1, OP_TRUE, OP_AND},
+			},
+			want: "stack underflow",
+		},
+		{
+			name: "or underflow after terminal segment",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Route:  []byte{OP_TRUE, OP_SLOT, 1, OP_TRUE, OP_OR},
+			},
+			want: "stack underflow",
+		},
 	}
-	_, err = NewBytecodeSplitRouter(SplitBytecodeRules{
-		System: &sysnetdebug.System{},
-		Route:  []byte{OP_DIAL, OP_SLOT, 1},
-	})
-	if err == nil ||
-		!strings.Contains(err.Error(), "not valid for SplitRouter") {
-		t.Fatalf(
-			"NewBytecodeSplitRouter(method op) error = %v, want SplitRouter validation error",
-			err,
-		)
-	}
-	_, err = NewBytecodeSplitRouter(SplitBytecodeRules{})
-	if err == nil || !strings.Contains(err.Error(), "system is nil") {
-		t.Fatalf(
-			"NewBytecodeSplitRouter(nil system) error = %v, want nil system error",
-			err,
-		)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewBytecodeSplitRouter(tt.rules)
+			if err == nil {
+				t.Fatal("NewBytecodeSplitRouter() succeeded, want error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf(
+					"NewBytecodeSplitRouter() error = %q, want substring %q",
+					err,
+					tt.want,
+				)
+			}
+		})
 	}
 }
 

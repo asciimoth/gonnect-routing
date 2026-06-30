@@ -126,7 +126,6 @@ func validateBytecode(
 	validateOp func(pc int, op byte, param uint64, kind bytecodeParamKind) error,
 ) error {
 	depth := 0
-	reachable := true
 	for pc := 0; pc < len(code); {
 		opPC := pc
 		op := code[pc]
@@ -138,9 +137,6 @@ func validateBytecode(
 		if err := validateOp(opPC, op, param, kind); err != nil {
 			return err
 		}
-		if !reachable {
-			continue
-		}
 		switch op {
 		case OP_DROP, OP_SLOT:
 			if depth < 1 {
@@ -151,7 +147,6 @@ func validateBytecode(
 				)
 			}
 			depth--
-			reachable = false
 		case OP_NOT:
 			if depth < 1 {
 				return fmt.Errorf(
