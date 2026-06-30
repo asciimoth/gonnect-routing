@@ -61,7 +61,7 @@ func TestBytecodeRouterCfgE2EComplexRuleset(t *testing.T) {
 		t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
 	}
 
-	r := gonnect.NewRouter()
+	r := gonnect.NewRouter(nil)
 	t.Cleanup(func() { _ = r.Close() })
 	r.SetCfg(cfg)
 	if err := r.Attach(2, gonnect.NewLoopbackNetwok()); err != nil {
@@ -126,7 +126,7 @@ func TestBytecodeRouterCfgE2EComplexRulesetFromLanguage(t *testing.T) {
 		t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
 	}
 
-	r := gonnect.NewRouter()
+	r := gonnect.NewRouter(nil)
 	t.Cleanup(func() { _ = r.Close() })
 	r.SetCfg(cfg)
 	if err := r.Attach(2, gonnect.NewLoopbackNetwok()); err != nil {
@@ -221,7 +221,7 @@ func TestBytecodeSplitRouterE2EComplexRuleset(t *testing.T) {
 	t.Cleanup(func() { _ = backend.Close() })
 	t.Cleanup(func() { _ = peer.Close() })
 
-	s := tun.NewSplitter()
+	s := tun.NewSplitter(nil, nil)
 	t.Cleanup(func() { _ = s.Close() })
 	s.SetRouter(router)
 	f2 := s.Get(2)
@@ -288,7 +288,7 @@ func TestBytecodeSplitRouterE2EComplexRulesetFromLanguage(t *testing.T) {
 	t.Cleanup(func() { _ = backend.Close() })
 	t.Cleanup(func() { _ = peer.Close() })
 
-	s := tun.NewSplitter()
+	s := tun.NewSplitter(nil, nil)
 	t.Cleanup(func() { _ = s.Close() })
 	s.SetRouter(router)
 	f2 := s.Get(2)
@@ -352,7 +352,7 @@ func TestBytecodeSplitRouterE2ENonNativeSkipsMatcher(t *testing.T) {
 	t.Cleanup(func() { _ = backend.Close() })
 	t.Cleanup(func() { _ = peer.Close() })
 
-	s := tun.NewSplitter()
+	s := tun.NewSplitter(nil, nil)
 	t.Cleanup(func() { _ = s.Close() })
 	s.SetRouter(router)
 	f4 := s.Get(4)
@@ -390,7 +390,7 @@ func TestBytecodeSplitRouterE2EDebugSystemDefaultMatcherMatchesNoFlows(t *testin
 	t.Cleanup(func() { _ = backend.Close() })
 	t.Cleanup(func() { _ = peer.Close() })
 
-	s := tun.NewSplitter()
+	s := tun.NewSplitter(nil, nil)
 	t.Cleanup(func() { _ = s.Close() })
 	s.SetRouter(router)
 	f4 := s.Get(4)
@@ -444,7 +444,7 @@ func TestBytecodeSplitRouterE2EDebugSystemRuleMatcherErrorDropsRuleMatch(t *test
 	t.Cleanup(func() { _ = backend.Close() })
 	t.Cleanup(func() { _ = peer.Close() })
 
-	s := tun.NewSplitter()
+	s := tun.NewSplitter(nil, nil)
 	t.Cleanup(func() { _ = s.Close() })
 	s.SetRouter(router)
 	f4 := s.Get(4)

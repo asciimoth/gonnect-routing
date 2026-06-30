@@ -2,7 +2,7 @@ module github.com/asciimoth/gonnect-routing
 
 go 1.25.5
 
-require github.com/asciimoth/gonnect v0.30.0
+require github.com/asciimoth/gonnect v0.31.0
 
 require (
 	github.com/asciimoth/bufpool v0.3.0 // indirect
