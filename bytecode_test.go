@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	gdns "github.com/asciimoth/gonnect/dns"
 	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
 	sysnetdebug "github.com/asciimoth/gonnect/sysnet/debug"
@@ -403,6 +404,334 @@ func TestBytecodeRouterCfgReusesStackAfterTerminalFallthrough(t *testing.T) {
 
 	if got := cfg.DialTCP("tcp", "", "example.com:443"); got != 2 {
 		t.Fatalf("DialTCP() = %d, want 2", got)
+	}
+}
+
+func TestReverseDNSCacheHelpers(t *testing.T) {
+	tests := []struct {
+		name string
+		code []byte
+		want addrStringOps
+	}{
+		{name: "empty"},
+		{
+			name: "non string address ops",
+			code: append(
+				append([]byte{OP_FQDN, OP_LFQDN, OP_TCP}, param16(OP_ADDR4, 0)...),
+				param16(OP_PORT, 443)...,
+			),
+		},
+		{
+			name: "remote string ops",
+			code: append(param16(OP_ADDR_S, 0), param16(OP_ADDR_RE, 0)...),
+			want: addrStringOps{remote: true},
+		},
+		{
+			name: "local string ops",
+			code: append(param16(OP_LADDR_S, 0), param16(OP_LADDR_RE, 0)...),
+			want: addrStringOps{local: true},
+		},
+		{
+			name: "mixed string ops",
+			code: append(param16(OP_ADDR_S, 0), param16(OP_LADDR_RE, 0)...),
+			want: addrStringOps{remote: true, local: true},
+		},
+		{
+			name: "skips parameter bytes",
+			code: param16(OP_PORT, uint16(OP_ADDR_S)),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := bytecodeAddrStringOps(tt.code); got != tt.want {
+				t.Fatalf("bytecodeAddrStringOps() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+
+	keyTests := []struct {
+		addr string
+		want string
+	}{
+		{addr: "192.0.2.10", want: "192.0.2.10.|12|1"},
+		{addr: "2001:db8::1", want: "2001:db8::1.|12|1"},
+		{addr: "::ffff:192.0.2.10", want: "192.0.2.10.|12|1"},
+	}
+	for _, tt := range keyTests {
+		if got := dnsPTRLiteralCacheKey(netip.MustParseAddr(tt.addr)); got != tt.want {
+			t.Fatalf("dnsPTRLiteralCacheKey(%q) = %q, want %q", tt.addr, got, tt.want)
+		}
+	}
+
+	storage := &staticDNSStorage{
+		msg: &gdns.Message{
+			Response: true,
+			RCode:    gdns.RCodeSuccess,
+			Answers: []gdns.Resource{
+				{
+					Type:  gdns.TypePTR,
+					Class: gdns.ClassIN,
+					Data:  []byte("first.test."),
+				},
+				{
+					Type:  gdns.TypePTR,
+					Class: gdns.ClassIN,
+					Data:  []byte("second.test."),
+				},
+				{Type: gdns.TypeA, Class: gdns.ClassIN, Data: []byte{192, 0, 2, 10}},
+				{Type: gdns.TypePTR, Class: 255, Data: []byte("wrong-class.test.")},
+				{Type: gdns.TypePTR, Class: gdns.ClassIN},
+			},
+		},
+		ok: true,
+	}
+	gotNames := reverseDNSNames(
+		storage,
+		netip.MustParseAddr("192.0.2.10"),
+		time.Now(),
+	)
+	wantNames := []string{"first.test.", "second.test."}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("reverseDNSNames() = %v, want %v", gotNames, wantNames)
+	}
+	if storage.key != "192.0.2.10.|12|1" {
+		t.Fatalf("reverseDNSNames() key = %q, want literal PTR key", storage.key)
+	}
+
+	malformed := []*gdns.Message{
+		nil,
+		{},
+		{Response: true, RCode: gdns.RCodeNameError},
+		{
+			Response: true,
+			RCode:    gdns.RCodeSuccess,
+			Answers:  []gdns.Resource{{Type: gdns.TypePTR, Class: gdns.ClassIN}},
+		},
+	}
+	for i, msg := range malformed {
+		got := reverseDNSNames(
+			&staticDNSStorage{msg: msg, ok: true},
+			netip.MustParseAddr("192.0.2.10"),
+			time.Now(),
+		)
+		if len(got) != 0 {
+			t.Fatalf("reverseDNSNames(malformed %d) = %v, want empty", i, got)
+		}
+	}
+
+	expired := gdns.NewMemoryStorage()
+	expired.Set(
+		"",
+		testPTRMessage("192.0.2.10", 1, "expired.test."),
+		time.Now().Add(-2*time.Second),
+	)
+	if got := reverseDNSNames(
+		expired,
+		netip.MustParseAddr("192.0.2.10"),
+		time.Now(),
+	); len(got) != 0 {
+		t.Fatalf("reverseDNSNames(expired) = %v, want empty", got)
+	}
+}
+
+func TestBytecodeRouterCfgMatchesReverseDNSCacheNames(t *testing.T) {
+	storage := gdns.NewMemoryStorage()
+	setTestPTR(storage, "192.0.2.10", "other.test.", "target.test.")
+	setTestPTR(storage, "198.51.100.1", "local.test.")
+	setTestPTR(storage, "2001:db8::10", "v6.test.")
+
+	cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+		Strings: []string{"target.test.", "local.test.", "v6.test."},
+		Regexps: []*regexp.Regexp{
+			regexp.MustCompile(`^target\.`),
+			regexp.MustCompile(`^local\.`),
+		},
+		DNSCacheStorage: storage,
+		DialTCP: append(
+			append(param16(OP_ADDR_S, 0), OP_SLOT, 2),
+			append(param16(OP_ADDR_S, 2), OP_SLOT, 8)...,
+		),
+		ListenTCP: append(param16(OP_LADDR_S, 1), OP_SLOT, 3),
+		DialUDP:   append(param16(OP_ADDR_RE, 0), OP_SLOT, 4),
+		RouteUDP: append(
+			append(param16(OP_ADDR_S, 0), OP_SLOT, 5),
+			append(param16(OP_LADDR_RE, 1), OP_SLOT, 6)...,
+		),
+		Lookup: append(param16(OP_ADDR_S, 0), OP_SLOT, 7),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+	}
+
+	if got := cfg.DialTCP("tcp", "", "192.0.2.10:443"); got != 2 {
+		t.Fatalf("DialTCP IPv4 PTR route = %d, want 2", got)
+	}
+	if got := cfg.DialTCP("tcp", "", "[2001:db8::10]:443"); got != 8 {
+		t.Fatalf("DialTCP bracketed IPv6 PTR route = %d, want 8", got)
+	}
+	if got := cfg.ListenTCP("tcp", "198.51.100.1:80"); got != 3 {
+		t.Fatalf("ListenTCP local PTR route = %d, want 3", got)
+	}
+	if got := cfg.DialUDP("udp", "", "192.0.2.10:53"); got != 4 {
+		t.Fatalf("DialUDP regexp PTR route = %d, want 4", got)
+	}
+	if got := cfg.RouteUDP(
+		"udp",
+		&net.UDPAddr{IP: net.IPv4(203, 0, 113, 1), Port: 1234},
+		&net.UDPAddr{IP: net.ParseIP("::ffff:192.0.2.10"), Port: 53},
+	); got != 5 {
+		t.Fatalf("RouteUDP mapped remote PTR route = %d, want 5", got)
+	}
+	if got := cfg.RouteUDP(
+		"udp",
+		&net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 1234},
+		&net.UDPAddr{IP: net.IPv4(203, 0, 113, 1), Port: 53},
+	); got != 6 {
+		t.Fatalf("RouteUDP local regexp PTR route = %d, want 6", got)
+	}
+	if got := cfg.Lookup("ip", "192.0.2.10"); got != 7 {
+		t.Fatalf("Lookup literal IP PTR route = %d, want 7", got)
+	}
+}
+
+func TestBytecodeRouterCfgReverseDNSCacheLookupIsLazy(t *testing.T) {
+	t.Run("fqdn input", func(t *testing.T) {
+		storage := newCountingDNSStorage()
+		cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+			Strings:         []string{"target.test."},
+			DNSCacheStorage: storage,
+			DialTCP:         append(param16(OP_ADDR_S, 0), OP_SLOT, 2),
+		})
+		if err != nil {
+			t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+		}
+		if got := cfg.DialTCP("tcp", "", "example.test:443"); got != 0 {
+			t.Fatalf("DialTCP() = %d, want 0", got)
+		}
+		if storage.getCalls != 0 {
+			t.Fatalf("DNS Get calls = %d, want 0", storage.getCalls)
+		}
+	})
+
+	t.Run("no string address ops", func(t *testing.T) {
+		storage := newCountingDNSStorage()
+		cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+			IPv4Addrs:       []uint32{ip4(192, 0, 2, 10)},
+			DNSCacheStorage: storage,
+			DialTCP:         append(param16(OP_ADDR4, 0), OP_SLOT, 2),
+		})
+		if err != nil {
+			t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+		}
+		if got := cfg.DialTCP("tcp", "", "192.0.2.10:443"); got != 2 {
+			t.Fatalf("DialTCP() = %d, want 2", got)
+		}
+		if storage.getCalls != 0 {
+			t.Fatalf("DNS Get calls = %d, want 0", storage.getCalls)
+		}
+	})
+
+	t.Run("original string match", func(t *testing.T) {
+		storage := newCountingDNSStorage()
+		cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+			Strings:         []string{"192.0.2.10"},
+			DNSCacheStorage: storage,
+			DialTCP:         append(param16(OP_ADDR_S, 0), OP_SLOT, 2),
+		})
+		if err != nil {
+			t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+		}
+		if got := cfg.DialTCP("tcp", "", "192.0.2.10:443"); got != 2 {
+			t.Fatalf("DialTCP() = %d, want 2", got)
+		}
+		if storage.getCalls != 0 {
+			t.Fatalf("DNS Get calls = %d, want 0", storage.getCalls)
+		}
+	})
+
+	t.Run("terminal before string op", func(t *testing.T) {
+		storage := newCountingDNSStorage()
+		cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+			Strings:         []string{"target.test."},
+			DNSCacheStorage: storage,
+			DialTCP: append(
+				[]byte{OP_TRUE, OP_SLOT, 2},
+				append(param16(OP_ADDR_S, 0), OP_SLOT, 3)...,
+			),
+		})
+		if err != nil {
+			t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+		}
+		if got := cfg.DialTCP("tcp", "", "192.0.2.10:443"); got != 2 {
+			t.Fatalf("DialTCP() = %d, want 2", got)
+		}
+		if storage.getCalls != 0 {
+			t.Fatalf("DNS Get calls = %d, want 0", storage.getCalls)
+		}
+	})
+
+	t.Run("remote-only program", func(t *testing.T) {
+		storage := newCountingDNSStorage()
+		cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+			Strings:         []string{"target.test."},
+			DNSCacheStorage: storage,
+			DialTCP:         append(param16(OP_ADDR_S, 0), OP_SLOT, 2),
+		})
+		if err != nil {
+			t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+		}
+		if got := cfg.DialTCP(
+			"tcp",
+			"198.51.100.1:1111",
+			"203.0.113.9:443",
+		); got != 0 {
+			t.Fatalf("DialTCP() = %d, want 0", got)
+		}
+		if storage.getCalls != 1 {
+			t.Fatalf("DNS Get calls = %d, want 1", storage.getCalls)
+		}
+		wantKey := "203.0.113.9.|12|1"
+		if !reflect.DeepEqual(storage.keys, []string{wantKey}) {
+			t.Fatalf("DNS Get keys = %v, want [%s]", storage.keys, wantKey)
+		}
+	})
+}
+
+func TestBytecodeRouterCfgReverseDNSCacheMemoizesPerAddress(t *testing.T) {
+	storage := newCountingDNSStorage()
+	setTestPTR(storage, "192.0.2.10", "target.test.")
+	setTestPTR(storage, "198.51.100.1", "local.test.")
+
+	cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+		Strings: []string{"target.test.", "local.test."},
+		Regexps: []*regexp.Regexp{
+			regexp.MustCompile(`^target\.`),
+			regexp.MustCompile(`^local\.`),
+		},
+		DNSCacheStorage: storage,
+		DialTCP: append(
+			append(
+				append(param16(OP_ADDR_S, 0), param16(OP_ADDR_RE, 0)...),
+				OP_OR,
+			),
+			append(
+				append(param16(OP_LADDR_S, 1), param16(OP_LADDR_RE, 1)...),
+				OP_OR, OP_AND, OP_SLOT, 2,
+			)...,
+		),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+	}
+	if got := cfg.DialTCP("tcp", "198.51.100.1:1111", "192.0.2.10:443"); got != 2 {
+		t.Fatalf("DialTCP() = %d, want 2", got)
+	}
+	if storage.getCalls != 2 {
+		t.Fatalf("DNS Get calls = %d, want 2", storage.getCalls)
+	}
+	wantKeys := []string{"192.0.2.10.|12|1", "198.51.100.1.|12|1"}
+	if !reflect.DeepEqual(storage.keys, wantKeys) {
+		t.Fatalf("DNS Get keys = %v, want %v", storage.keys, wantKeys)
 	}
 }
 
@@ -1032,6 +1361,309 @@ func TestBytecodeSplitRouterRouteCacheKeyIncludesProtocol(t *testing.T) {
 	}
 }
 
+func TestBytecodeSplitRouterMatchesReverseDNSCacheNamesFastPath(t *testing.T) {
+	storage := newCountingDNSStorage()
+	setTestPTR(storage, "192.0.2.10", "dst.test.")
+	setTestPTR(storage, "198.51.100.1", "src.test.")
+	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System: &sysnetdebug.System{},
+		Strings: []string{
+			"dst.test.",
+			"src.test.",
+		},
+		Regexps: []*regexp.Regexp{
+			regexp.MustCompile(`^dst\.`),
+			regexp.MustCompile(`^src\.`),
+		},
+		DNSCacheStorage: storage,
+		RouteCacheTTL:   -1,
+		Route: slotWhen(andAll(
+			param16(OP_ADDR_S, 0),
+			param16(OP_ADDR_RE, 0),
+			param16(OP_LADDR_S, 1),
+			param16(OP_LADDR_RE, 1),
+		), 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+
+	if got := router.Route(
+		ipv4TCPPacket([4]byte{198, 51, 100, 1}, [4]byte{192, 0, 2, 10}, 1, 2),
+		0,
+		false,
+	); got != 8 {
+		t.Fatalf("Route() = %d, want 8", got)
+	}
+	if storage.getCalls != 2 {
+		t.Fatalf("DNS Get calls = %d, want 2", storage.getCalls)
+	}
+	wantKeys := []string{"192.0.2.10.|12|1", "198.51.100.1.|12|1"}
+	if !reflect.DeepEqual(storage.keys, wantKeys) {
+		t.Fatalf("DNS Get keys = %v, want %v", storage.keys, wantKeys)
+	}
+}
+
+func TestBytecodeSplitRouterMatchesReverseDNSCacheNamesRecursivePath(t *testing.T) {
+	storage := newCountingDNSStorage()
+	setTestPTR(storage, "192.0.2.10", "dst.test.")
+	expr := append([]byte{}, param16(OP_ADDR_S, 0)...)
+	expr = append(expr, param16(OP_ADDR_RE, 0)...)
+	expr = append(expr, OP_AND, OP_NOT)
+	route := append(expr, OP_DROP)
+	route = append(route, OP_TRUE, OP_SLOT, 8)
+	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:          &sysnetdebug.System{},
+		Strings:         []string{"dst.test."},
+		Regexps:         []*regexp.Regexp{regexp.MustCompile(`^dst\.`)},
+		DNSCacheStorage: storage,
+		RouteCacheTTL:   -1,
+		Route:           route,
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+	if cfg := router.(*bytecodeSplitRouter); !cfg.routeCompiled ||
+		cfg.routeSegments[0].fastKind != splitFastCondNone {
+		t.Fatalf("route did not compile to recursive path: compiled=%v fastKind=%v",
+			cfg.routeCompiled,
+			cfg.routeSegments[0].fastKind,
+		)
+	}
+
+	if got := router.Route(
+		ipv4TCPPacket([4]byte{198, 51, 100, 1}, [4]byte{192, 0, 2, 10}, 1, 2),
+		0,
+		false,
+	); got != 8 {
+		t.Fatalf("Route() = %d, want 8", got)
+	}
+	if storage.getCalls != 1 {
+		t.Fatalf("DNS Get calls = %d, want 1", storage.getCalls)
+	}
+}
+
+func TestBytecodeSplitRouterMatchesReverseDNSCacheNamesFallbackPath(t *testing.T) {
+	storage := newCountingDNSStorage()
+	setTestPTR(storage, "192.0.2.10", "dst.test.")
+	route := append([]byte{OP_TRUE}, param16(OP_ADDR_S, 0)...)
+	route = append(route, OP_SLOT, 8, OP_SLOT, 2)
+	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:          &sysnetdebug.System{},
+		Strings:         []string{"dst.test."},
+		DNSCacheStorage: storage,
+		RouteCacheTTL:   -1,
+		Route:           route,
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+	if cfg := router.(*bytecodeSplitRouter); cfg.routeCompiled {
+		t.Fatal("route compiled, want generic fallback path")
+	}
+
+	if got := router.Route(
+		ipv4TCPPacket([4]byte{198, 51, 100, 1}, [4]byte{192, 0, 2, 10}, 1, 2),
+		0,
+		false,
+	); got != 8 {
+		t.Fatalf("Route() = %d, want 8", got)
+	}
+	if storage.getCalls != 1 {
+		t.Fatalf("DNS Get calls = %d, want 1", storage.getCalls)
+	}
+}
+
+func TestBytecodeSplitRouterReverseDNSCacheLookupIsLazy(t *testing.T) {
+	pkt := ipv4TCPPacket([4]byte{198, 51, 100, 1}, [4]byte{192, 0, 2, 10}, 1, 2)
+	tests := []struct {
+		name  string
+		rules SplitBytecodeRules
+		want  int
+	}{
+		{
+			name: "no string address ops",
+			rules: SplitBytecodeRules{
+				System:    &sysnetdebug.System{},
+				IPv4Addrs: []uint32{ip4(192, 0, 2, 10)},
+				Route:     slotWhen(param16(OP_ADDR4, 0), 8),
+			},
+			want: 8,
+		},
+		{
+			name: "original string match",
+			rules: SplitBytecodeRules{
+				System:  &sysnetdebug.System{},
+				Strings: []string{"192.0.2.10"},
+				Route:   slotWhen(param16(OP_ADDR_S, 0), 8),
+			},
+			want: 8,
+		},
+		{
+			name: "false and guard",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Strings: []string{
+					"dst.test.",
+				},
+				Route: slotWhen(andAll(
+					[]byte{OP_FALSE},
+					param16(OP_ADDR_S, 0),
+				), 8),
+			},
+		},
+		{
+			name: "true or guard",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Strings: []string{
+					"dst.test.",
+				},
+				Route: slotWhen(orOp(
+					[]byte{OP_TRUE},
+					param16(OP_ADDR_S, 0),
+				), 8),
+			},
+			want: 8,
+		},
+		{
+			name: "terminal before string op",
+			rules: SplitBytecodeRules{
+				System: &sysnetdebug.System{},
+				Strings: []string{
+					"dst.test.",
+				},
+				Route: append(
+					slotWhen([]byte{OP_TRUE}, 8),
+					slotWhen(param16(OP_ADDR_S, 0), 9)...,
+				),
+			},
+			want: 8,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			storage := newCountingDNSStorage()
+			tt.rules.DNSCacheStorage = storage
+			router, err := NewBytecodeSplitRouter(tt.rules)
+			if err != nil {
+				t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+			}
+			t.Cleanup(func() { _ = router.Close() })
+			if got := router.Route(pkt, 0, false); got != tt.want {
+				t.Fatalf("Route() = %d, want %d", got, tt.want)
+			}
+			if storage.getCalls != 0 {
+				t.Fatalf("DNS Get calls = %d, want 0", storage.getCalls)
+			}
+		})
+	}
+}
+
+func TestBytecodeSplitRouterRouteCacheSkipsDNSDependentResults(t *testing.T) {
+	pkt := ipv4TCPPacket([4]byte{198, 51, 100, 1}, [4]byte{192, 0, 2, 10}, 1, 2)
+	route := append(
+		slotWhen(param16(OP_ADDR_S, 0), 8),
+		slotWhen([]byte{OP_TRUE}, 2)...,
+	)
+
+	t.Run("miss can become hit", func(t *testing.T) {
+		storage := newCountingDNSStorage()
+		router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+			System:          &sysnetdebug.System{},
+			Strings:         []string{"dst.test."},
+			DNSCacheStorage: storage,
+			RouteCacheTTL:   time.Minute,
+			Route:           route,
+		})
+		if err != nil {
+			t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+		}
+		t.Cleanup(func() { _ = router.Close() })
+
+		if got := router.Route(pkt, 0, false); got != 2 {
+			t.Fatalf("Route(first) = %d, want 2", got)
+		}
+		setTestPTR(storage, "192.0.2.10", "dst.test.")
+		if got := router.Route(pkt, 0, false); got != 8 {
+			t.Fatalf("Route(second) = %d, want 8", got)
+		}
+		if storage.getCalls != 2 {
+			t.Fatalf("DNS Get calls = %d, want 2", storage.getCalls)
+		}
+	})
+
+	t.Run("hit can become miss", func(t *testing.T) {
+		storage := newCountingDNSStorage()
+		setTestPTR(storage, "192.0.2.10", "dst.test.")
+		router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+			System:          &sysnetdebug.System{},
+			Strings:         []string{"dst.test."},
+			DNSCacheStorage: storage,
+			RouteCacheTTL:   time.Minute,
+			Route:           route,
+		})
+		if err != nil {
+			t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+		}
+		t.Cleanup(func() { _ = router.Close() })
+
+		if got := router.Route(pkt, 0, false); got != 8 {
+			t.Fatalf("Route(first) = %d, want 8", got)
+		}
+		storage.Delete("192.0.2.10.|12|1")
+		if got := router.Route(pkt, 0, false); got != 2 {
+			t.Fatalf("Route(second) = %d, want 2", got)
+		}
+		if storage.getCalls != 2 {
+			t.Fatalf("DNS Get calls = %d, want 2", storage.getCalls)
+		}
+	})
+}
+
+func TestBytecodeSplitRouterRouteCacheStillCachesOriginalStringMatches(t *testing.T) {
+	var matchCalls int
+	system := &sysnetdebug.System{
+		RuleMatcher: func(sysnet.Rule, sockowner.FlowTuple) (bool, error) {
+			matchCalls++
+			return true, nil
+		},
+	}
+	storage := newCountingDNSStorage()
+	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System:          system,
+		Rules:           []sysnet.Rule{{Type: "test", Rule: "original string"}},
+		Strings:         []string{"192.0.2.10"},
+		DNSCacheStorage: storage,
+		RuleCacheTTL:    -1,
+		RouteCacheTTL:   time.Minute,
+		Route: slotWhen(andAll(
+			param16(OP_ADDR_S, 0),
+			param16(OP_RULE, 0),
+		), 8),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+
+	pkt := ipv4TCPPacket([4]byte{198, 51, 100, 1}, [4]byte{192, 0, 2, 10}, 1, 2)
+	for i := 0; i < 2; i++ {
+		if got := router.Route(pkt, 0, true); got != 8 {
+			t.Fatalf("Route(%d) = %d, want 8", i, got)
+		}
+	}
+	if storage.getCalls != 0 {
+		t.Fatalf("DNS Get calls = %d, want 0", storage.getCalls)
+	}
+	if matchCalls != 1 {
+		t.Fatalf("matcher calls = %d, want 1", matchCalls)
+	}
+}
+
 func TestBytecodeSplitRouterSkipsMatcherForPacketsWithoutFlows(t *testing.T) {
 	rule := sysnet.Rule{Type: "test", Rule: "flow only"}
 	var matchCalls int
@@ -1217,6 +1849,85 @@ func param16(op byte, param uint16) []byte {
 
 func ip4(a, b, c, d byte) uint32 {
 	return binary.BigEndian.Uint32([]byte{a, b, c, d})
+}
+
+type staticDNSStorage struct {
+	msg      *gdns.Message
+	ok       bool
+	getCalls int
+	key      string
+}
+
+func (s *staticDNSStorage) Get(key string, _ time.Time) (*gdns.Message, bool) {
+	s.getCalls++
+	s.key = key
+	return s.msg, s.ok
+}
+
+func (s *staticDNSStorage) Set(_ string, _ *gdns.Message, _ time.Time) {}
+
+func (s *staticDNSStorage) Delete(_ string) {}
+
+type countingDNSStorage struct {
+	inner    gdns.CacheStorage
+	getCalls int
+	keys     []string
+}
+
+func newCountingDNSStorage() *countingDNSStorage {
+	return &countingDNSStorage{inner: gdns.NewMemoryStorage()}
+}
+
+func (s *countingDNSStorage) Get(
+	key string,
+	now time.Time,
+) (*gdns.Message, bool) {
+	s.getCalls++
+	s.keys = append(s.keys, key)
+	return s.inner.Get(key, now)
+}
+
+func (s *countingDNSStorage) Set(
+	key string,
+	msg *gdns.Message,
+	now time.Time,
+) {
+	s.inner.Set(key, msg, now)
+}
+
+func (s *countingDNSStorage) Delete(key string) {
+	s.inner.Delete(key)
+}
+
+func setTestPTR(storage gdns.CacheStorage, addr string, names ...string) {
+	storage.Set("", testPTRMessage(addr, 60, names...), time.Now())
+}
+
+func testPTRMessage(addr string, ttl uint32, names ...string) *gdns.Message {
+	name := addr
+	if !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	msg := &gdns.Message{
+		Response: true,
+		RCode:    gdns.RCodeSuccess,
+		Questions: []gdns.Question{{
+			Name:  name,
+			Type:  gdns.TypePTR,
+			Class: gdns.ClassIN,
+		}},
+		Answers: make([]gdns.Resource, 0, len(names)),
+	}
+	for _, answer := range names {
+		msg.Answers = append(msg.Answers, gdns.Resource{
+			Name:  name,
+			Type:  gdns.TypePTR,
+			Class: gdns.ClassIN,
+			TTL:   ttl,
+			Data:  []byte(answer),
+		})
+	}
+	return msg
 }
 
 func ipv4TCPPacket(src, dst [4]byte, srcPort, dstPort uint16) []byte {

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	gdns "github.com/asciimoth/gonnect/dns"
 	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
 	sysnetdebug "github.com/asciimoth/gonnect/sysnet/debug"
@@ -35,6 +36,121 @@ func BenchmarkBytecodeSplitRouterRouteStatic(b *testing.B) {
 			param16(OP_PORT, 443),
 			param16(OP_LPORT, 12345),
 		), 2),
+	})
+	pkt := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 2},
+		12345,
+		443,
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	var slot int
+	for b.Loop() {
+		slot = router.Route(pkt, 0, false)
+	}
+	benchmarkRouteSlot = slot
+}
+
+func BenchmarkBytecodeSplitRouterRouteDNSCacheSuppliedNoStringOps(b *testing.B) {
+	router := newBenchmarkSplitRouter(b, SplitBytecodeRules{
+		System:          &sysnetdebug.System{},
+		DNSCacheStorage: gdns.NewMemoryStorage(),
+		IPv4Addrs: []uint32{
+			ip4(192, 0, 2, 2),
+			ip4(10, 0, 0, 1),
+		},
+		RouteCacheTTL: -1,
+		Route: slotWhen(andAll(
+			[]byte{OP_NET4},
+			[]byte{OP_TCP},
+			param16(OP_ADDR4, 0),
+			param16(OP_LADDR4, 1),
+			param16(OP_PORT, 443),
+			param16(OP_LPORT, 12345),
+		), 2),
+	})
+	pkt := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 2},
+		12345,
+		443,
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	var slot int
+	for b.Loop() {
+		slot = router.Route(pkt, 0, false)
+	}
+	benchmarkRouteSlot = slot
+}
+
+func BenchmarkBytecodeSplitRouterRouteDNSCacheGuardedFalse(b *testing.B) {
+	storage := gdns.NewMemoryStorage()
+	setTestPTR(storage, "192.0.2.2", "dst.test.")
+	router := newBenchmarkSplitRouter(b, SplitBytecodeRules{
+		System:          &sysnetdebug.System{},
+		Strings:         []string{"dst.test."},
+		DNSCacheStorage: storage,
+		IPv4Addrs:       []uint32{ip4(203, 0, 113, 1)},
+		RouteCacheTTL:   -1,
+		Route: slotWhen(andAll(
+			[]byte{OP_TCP},
+			param16(OP_ADDR4, 0),
+			param16(OP_ADDR_S, 0),
+		), 8),
+	})
+	pkt := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 2},
+		12345,
+		443,
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	var slot int
+	for b.Loop() {
+		slot = router.Route(pkt, 0, false)
+	}
+	benchmarkRouteSlot = slot
+}
+
+func BenchmarkBytecodeSplitRouterRouteDNSCacheHit(b *testing.B) {
+	storage := gdns.NewMemoryStorage()
+	setTestPTR(storage, "192.0.2.2", "dst.test.")
+	router := newBenchmarkSplitRouter(b, SplitBytecodeRules{
+		System:          &sysnetdebug.System{},
+		Strings:         []string{"dst.test."},
+		DNSCacheStorage: storage,
+		RouteCacheTTL:   -1,
+		Route:           slotWhen(param16(OP_ADDR_S, 0), 8),
+	})
+	pkt := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 2},
+		12345,
+		443,
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	var slot int
+	for b.Loop() {
+		slot = router.Route(pkt, 0, false)
+	}
+	benchmarkRouteSlot = slot
+}
+
+func BenchmarkBytecodeSplitRouterRouteDNSCacheMiss(b *testing.B) {
+	router := newBenchmarkSplitRouter(b, SplitBytecodeRules{
+		System:          &sysnetdebug.System{},
+		Strings:         []string{"dst.test."},
+		DNSCacheStorage: gdns.NewMemoryStorage(),
+		RouteCacheTTL:   -1,
+		Route:           slotWhen(param16(OP_ADDR_S, 0), 8),
 	})
 	pkt := ipv4TCPPacket(
 		[4]byte{10, 0, 0, 1},

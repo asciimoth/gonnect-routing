@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/asciimoth/gonnect"
+	gdns "github.com/asciimoth/gonnect/dns"
 )
 
 const (
@@ -322,10 +325,22 @@ type addrCache struct {
 
 	portDone bool
 	portVal  int
+
+	reverseStorage gdns.CacheStorage
+	reverseEnabled bool
+	reverseDone    bool
+	reverseNames   []string
 }
 
-func newAddrCache(input addrInput) *addrCache {
-	return &addrCache{input: input}
+func newAddrCache(input addrInput, storage gdns.CacheStorage, reverse bool) *addrCache {
+	if !reverse {
+		storage = nil
+	}
+	return &addrCache{
+		input:          input,
+		reverseStorage: storage,
+		reverseEnabled: storage != nil,
+	}
 }
 
 func (a *addrCache) host() string {
@@ -462,6 +477,103 @@ func (a *addrCache) rawString() string {
 		return a.input.addr.String()
 	}
 	return a.input.str
+}
+
+func (a *addrCache) matchString(want string) bool {
+	if a.host() == want {
+		return true
+	}
+	for _, name := range a.reverseDNSNames() {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *addrCache) matchRegexp(re *regexp.Regexp) bool {
+	if re.MatchString(a.host()) {
+		return true
+	}
+	for _, name := range a.reverseDNSNames() {
+		if re.MatchString(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *addrCache) reverseDNSNames() []string {
+	if a == nil || !a.reverseEnabled || a.reverseStorage == nil {
+		return nil
+	}
+	if a.reverseDone {
+		return a.reverseNames
+	}
+	a.reverseDone = true
+	ip := a.ip()
+	if !ip.IsValid() {
+		return nil
+	}
+	a.reverseNames = reverseDNSNames(a.reverseStorage, ip, time.Now())
+	return a.reverseNames
+}
+
+type addrStringOps struct {
+	remote bool
+	local  bool
+}
+
+func bytecodeAddrStringOps(code []byte) addrStringOps {
+	var ops addrStringOps
+	for pc := 0; pc < len(code); {
+		op := code[pc]
+		pc++
+		_, next := readBytecodeParamUnchecked(code, pc, op)
+		pc = next
+		switch op {
+		case OP_ADDR_S, OP_ADDR_RE:
+			ops.remote = true
+		case OP_LADDR_S, OP_LADDR_RE:
+			ops.local = true
+		}
+	}
+	return ops
+}
+
+func dnsPTRLiteralCacheKey(addr netip.Addr) string {
+	addr = addr.Unmap()
+	if !addr.IsValid() {
+		return ""
+	}
+	return addr.String() + ".|12|1"
+}
+
+func reverseDNSNames(
+	storage gdns.CacheStorage,
+	addr netip.Addr,
+	now time.Time,
+) []string {
+	if storage == nil {
+		return nil
+	}
+	key := dnsPTRLiteralCacheKey(addr)
+	if key == "" {
+		return nil
+	}
+	msg, ok := storage.Get(key, now)
+	if !ok || msg == nil || !msg.Response || msg.RCode != gdns.RCodeSuccess {
+		return nil
+	}
+	var names []string
+	for _, rr := range msg.Answers {
+		if rr.Type != gdns.TypePTR || rr.Class != gdns.ClassIN ||
+			len(rr.Data) == 0 {
+			continue
+		}
+		names = append(names, string(rr.Data))
+	}
+	return names
 }
 
 func hostFromString(s string) string {

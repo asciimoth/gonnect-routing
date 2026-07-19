@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/asciimoth/gonnect"
+	gdns "github.com/asciimoth/gonnect/dns"
 )
 
 // BytecodeRules contains the immutable tables and bytecode programs used to
@@ -23,6 +24,9 @@ import (
 //
 // Every bytecode slice is validated by NewBytecodeRouterCfg. The constructor
 // copies all slices, so later changes to BytecodeRules do not affect routing.
+// When DNSCacheStorage is set, cached reverse DNS names are matched exactly as
+// stored; names produced by github.com/asciimoth/gonnect/dns.Cache are usually
+// absolute names with a trailing dot, such as "example.test.".
 type BytecodeRules struct {
 	Strings     []string
 	Regexps     []*regexp.Regexp
@@ -30,6 +34,8 @@ type BytecodeRules struct {
 	IPv4Subnets []IPv4Subnet
 	IPv6Addrs   []netip.Addr
 	IPv6Subnets []netip.Prefix
+
+	DNSCacheStorage gdns.CacheStorage
 
 	DialTCP   []byte
 	ListenTCP []byte
@@ -58,10 +64,16 @@ func NewBytecodeRouterCfg(rules BytecodeRules) (RouterCfg, error) {
 		dialUDP:     append([]byte(nil), rules.DialUDP...),
 		routeUDP:    append([]byte(nil), rules.RouteUDP...),
 		lookup:      append([]byte(nil), rules.Lookup...),
+		dnsStorage:  rules.DNSCacheStorage,
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	cfg.dialTCPStringOps = bytecodeAddrStringOps(cfg.dialTCP)
+	cfg.listenTCPStringOps = bytecodeAddrStringOps(cfg.listenTCP)
+	cfg.dialUDPStringOps = bytecodeAddrStringOps(cfg.dialUDP)
+	cfg.routeUDPStringOps = bytecodeAddrStringOps(cfg.routeUDP)
+	cfg.lookupStringOps = bytecodeAddrStringOps(cfg.lookup)
 	cfg.mentionedSlots = mentionedBytecodeSlots(
 		gonnect.RouterSlots,
 		cfg.dialTCP,
@@ -86,6 +98,14 @@ type bytecodeRouterCfg struct {
 	dialUDP   []byte
 	routeUDP  []byte
 	lookup    []byte
+
+	dnsStorage gdns.CacheStorage
+
+	dialTCPStringOps   addrStringOps
+	listenTCPStringOps addrStringOps
+	dialUDPStringOps   addrStringOps
+	routeUDPStringOps  addrStringOps
+	lookupStringOps    addrStringOps
 
 	mentionedSlots []int
 }
@@ -112,6 +132,7 @@ func (cfg *bytecodeRouterCfg) DialTCP(network, laddr, raddr string) int {
 		network,
 		addrInput{str: laddr},
 		addrInput{str: raddr},
+		cfg.dialTCPStringOps,
 	)
 }
 
@@ -122,6 +143,7 @@ func (cfg *bytecodeRouterCfg) ListenTCP(network, laddr string) int {
 		network,
 		addrInput{str: laddr},
 		addrInput{},
+		cfg.listenTCPStringOps,
 	)
 }
 
@@ -132,6 +154,7 @@ func (cfg *bytecodeRouterCfg) DialUDP(network, laddr, raddr string) int {
 		network,
 		addrInput{str: laddr},
 		addrInput{str: raddr},
+		cfg.dialUDPStringOps,
 	)
 }
 
@@ -145,6 +168,7 @@ func (cfg *bytecodeRouterCfg) RouteUDP(
 		network,
 		addrInput{addr: laddr},
 		addrInput{addr: raddr},
+		cfg.routeUDPStringOps,
 	)
 }
 
@@ -155,6 +179,7 @@ func (cfg *bytecodeRouterCfg) Lookup(network, address string) int {
 		network,
 		addrInput{},
 		addrInput{str: address},
+		cfg.lookupStringOps,
 	)
 }
 
@@ -296,11 +321,12 @@ func (cfg *bytecodeRouterCfg) exec(
 	method bytecodeMethod,
 	network string,
 	laddr, raddr addrInput,
+	stringOps addrStringOps,
 ) int {
 	ev := bytecodeEval{
 		network:  strings.ToLower(network),
-		laddr:    newAddrCache(laddr),
-		raddr:    newAddrCache(raddr),
+		laddr:    newAddrCache(laddr, cfg.dnsStorage, stringOps.local),
+		raddr:    newAddrCache(raddr, cfg.dnsStorage, stringOps.remote),
 		isDial:   method == bytecodeMethodDial,
 		isListen: method == bytecodeMethodListen,
 		isLookup: method == bytecodeMethodLookup,
@@ -358,21 +384,21 @@ func (cfg *bytecodeRouterCfg) exec(
 			stack = append(stack, ev.laddr.isFQDN())
 		case OP_ADDR_S:
 			idx, ok := bytecodeParamIndex(param, len(cfg.strings))
-			stack = append(stack, ok && ev.raddr.host() == cfg.strings[idx])
+			stack = append(stack, ok && ev.raddr.matchString(cfg.strings[idx]))
 		case OP_LADDR_S:
 			idx, ok := bytecodeParamIndex(param, len(cfg.strings))
-			stack = append(stack, ok && ev.laddr.host() == cfg.strings[idx])
+			stack = append(stack, ok && ev.laddr.matchString(cfg.strings[idx]))
 		case OP_ADDR_RE:
 			idx, ok := bytecodeParamIndex(param, len(cfg.regexps))
 			stack = append(
 				stack,
-				ok && cfg.regexps[idx].MatchString(ev.raddr.host()),
+				ok && ev.raddr.matchRegexp(cfg.regexps[idx]),
 			)
 		case OP_LADDR_RE:
 			idx, ok := bytecodeParamIndex(param, len(cfg.regexps))
 			stack = append(
 				stack,
-				ok && cfg.regexps[idx].MatchString(ev.laddr.host()),
+				ok && ev.laddr.matchRegexp(cfg.regexps[idx]),
 			)
 		case OP_ADDR4:
 			idx, ok := bytecodeParamIndex(param, len(cfg.ipv4Addrs))

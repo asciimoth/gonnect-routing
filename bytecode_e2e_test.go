@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/asciimoth/gonnect"
+	gdns "github.com/asciimoth/gonnect/dns"
 	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
 	sysnetdebug "github.com/asciimoth/gonnect/sysnet/debug"
@@ -168,6 +169,38 @@ func TestBytecodeRouterCfgE2EComplexRulesetFromLanguage(t *testing.T) {
 	}
 }
 
+func TestBytecodeRouterCfgE2EReverseDNSCacheDialTCP(t *testing.T) {
+	ctx := t.Context()
+	storage := gdns.NewMemoryStorage()
+	setTestPTR(storage, "127.0.0.1", "loopback.test.")
+	cfg, err := NewBytecodeRouterCfg(BytecodeRules{
+		Strings:         []string{"loopback.test."},
+		DNSCacheStorage: storage,
+		DialTCP:         append(param16(OP_ADDR_S, 0), OP_SLOT, 2),
+		ListenTCP:       []byte{OP_TRUE, OP_SLOT, 2},
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeRouterCfg() error = %v", err)
+	}
+
+	r := gonnect.NewRouter(nil)
+	t.Cleanup(func() { _ = r.Close() })
+	r.SetCfg(cfg)
+	if err := r.Attach(2, gonnect.NewLoopbackNetwok()); err != nil {
+		t.Fatalf("Attach(2) error = %v", err)
+	}
+
+	assertRouterTCPRoundTrip(
+		t,
+		ctx,
+		r,
+		"tcp4",
+		"127.0.0.1:34101",
+		"127.0.0.1:0",
+		"reverse-dns-tcp",
+	)
+}
+
 func TestBytecodeSplitRouterE2EComplexRuleset(t *testing.T) {
 	rule := sysnet.Rule{Type: "test", Rule: "native rule with spaces"}
 	var matchCalls int
@@ -259,6 +292,80 @@ func TestBytecodeSplitRouterE2EComplexRuleset(t *testing.T) {
 
 	if matchCalls == 0 {
 		t.Fatal("Matcher.Match was not called for native packet")
+	}
+}
+
+func TestBytecodeSplitRouterE2EReverseDNSCache(t *testing.T) {
+	storage := gdns.NewMemoryStorage()
+	setTestPTR(storage, "192.0.2.2", "dst.test.")
+	setTestPTR(storage, "2001:db8::1", "src6.test.")
+	router, err := NewBytecodeSplitRouter(SplitBytecodeRules{
+		System: &sysnetdebug.System{},
+		Strings: []string{
+			"dst.test.",
+			"src6.test.",
+			"192.0.2.3",
+		},
+		DNSCacheStorage: storage,
+		Route: append(
+			append(
+				slotWhen(param16(OP_ADDR_S, 0), 4),
+				slotWhen(param16(OP_LADDR_S, 1), 5)...,
+			),
+			slotWhen(param16(OP_ADDR_S, 2), 6)...,
+		),
+	})
+	if err != nil {
+		t.Fatalf("NewBytecodeSplitRouter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+
+	backend, peer := tun.Pipe(4, 1500, 3, 5)
+	t.Cleanup(func() { _ = backend.Close() })
+	t.Cleanup(func() { _ = peer.Close() })
+
+	s := tun.NewSplitter(nil, nil)
+	t.Cleanup(func() { _ = s.Close() })
+	s.SetRouter(router)
+	f4 := s.Get(4)
+	f5 := s.Get(5)
+	f6 := s.Get(6)
+	if err := s.Attach(nativeTestTun{Tun: backend}); err != nil {
+		t.Fatalf("Attach(native pipe) error = %v", err)
+	}
+
+	tcp4 := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 2},
+		12345,
+		443,
+	)
+	writeTunPacket(t, peer, tcp4)
+	if got := readTunPacket(t, f4); !bytes.Equal(got, tcp4) {
+		t.Fatalf("frontend 4 packet = %x, want %x", got, tcp4)
+	}
+
+	udp6 := ipv6UDPPacket(
+		netip.MustParseAddr("2001:db8::1"),
+		netip.MustParseAddr("2001:db8::2"),
+		5353,
+		53,
+		[]byte{1, 2, 3, 4},
+	)
+	writeTunPacket(t, peer, udp6)
+	if got := readTunPacket(t, f5); !bytes.Equal(got, udp6) {
+		t.Fatalf("frontend 5 packet = %x, want %x", got, udp6)
+	}
+
+	original := ipv4TCPPacket(
+		[4]byte{10, 0, 0, 1},
+		[4]byte{192, 0, 2, 3},
+		12345,
+		443,
+	)
+	writeTunPacket(t, peer, original)
+	if got := readTunPacket(t, f6); !bytes.Equal(got, original) {
+		t.Fatalf("frontend 6 packet = %x, want %x", got, original)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/asciimoth/gonnect"
+	gdns "github.com/asciimoth/gonnect/dns"
 	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
 	"github.com/asciimoth/gonnect/tun"
@@ -23,7 +24,10 @@ import (
 // indexes Rules and is evaluated by a sysnet.Matcher built from System. The
 // RouterCfg method opcodes OP_DIAL, OP_LISTEN, and OP_LOOKUP are not valid for
 // packet routing. The constructor validates and copies all slices before
-// returning the router.
+// returning the router. When DNSCacheStorage is set, cached reverse DNS names
+// are matched exactly as stored; names produced by
+// github.com/asciimoth/gonnect/dns.Cache are usually absolute names with a
+// trailing dot, such as "example.test.".
 type SplitBytecodeRules struct {
 	System sysnet.System
 	Rules  []sysnet.Rule
@@ -52,6 +56,8 @@ type SplitBytecodeRules struct {
 	IPv4Subnets []IPv4Subnet
 	IPv6Addrs   []netip.Addr
 	IPv6Subnets []netip.Prefix
+
+	DNSCacheStorage gdns.CacheStorage
 
 	Route []byte
 }
@@ -96,6 +102,10 @@ func NewBytecodeSplitRouter(rules SplitBytecodeRules) (SplitRouter, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	cfg.routeStringOps = bytecodeAddrStringOps(cfg.route)
+	if cfg.routeStringOps.remote || cfg.routeStringOps.local {
+		cfg.dnsStorage = rules.DNSCacheStorage
+	}
 	cfg.splitSubnets = compileSplitIPv4Subnets(cfg.ipv4Subnets)
 	cfg.routeProgram, cfg.routeStackDepth = compileSplitBytecode(cfg.route)
 	cfg.routeConds, cfg.routeSegments, cfg.routeCompiled = compileSplitRoute(
@@ -130,9 +140,11 @@ type bytecodeSplitRouter struct {
 	// routeConds and routeSegments are the optimized, segment-oriented form of
 	// route. routeCompiled is false only when the optimizer sees a bytecode shape
 	// it cannot prove is a sequence of terminal condition/action segments.
-	routeConds    []splitCond
-	routeSegments []splitRouteSegment
-	routeCompiled bool
+	routeConds     []splitCond
+	routeSegments  []splitRouteSegment
+	routeCompiled  bool
+	routeStringOps addrStringOps
+	dnsStorage     gdns.CacheStorage
 	// ruleCache memoizes expensive OP_RULE matcher results by flow; routeCache
 	// memoizes the final slot for the whole bytecode program by the same packet
 	// fields plus parser/native-state flags that affect routing semantics.
@@ -255,16 +267,16 @@ func (cfg *bytecodeSplitRouter) Route(
 				stack[sp] = false
 				sp++
 			case OP_ADDR_S:
-				stack[sp] = ev.dstString() == cfg.strings[inst.param]
+				stack[sp] = ev.matchDstString(cfg.strings[inst.param])
 				sp++
 			case OP_LADDR_S:
-				stack[sp] = ev.srcString() == cfg.strings[inst.param]
+				stack[sp] = ev.matchSrcString(cfg.strings[inst.param])
 				sp++
 			case OP_ADDR_RE:
-				stack[sp] = cfg.regexps[inst.param].MatchString(ev.dstString())
+				stack[sp] = ev.matchDstRegexp(cfg.regexps[inst.param])
 				sp++
 			case OP_LADDR_RE:
-				stack[sp] = cfg.regexps[inst.param].MatchString(ev.srcString())
+				stack[sp] = ev.matchSrcRegexp(cfg.regexps[inst.param])
 				sp++
 			case OP_ADDR4:
 				stack[sp] = pkt.dst4 == cfg.ipv4Addrs[inst.param] && pkt.dst.Is4()
@@ -866,10 +878,14 @@ type splitEval struct {
 	flowOK   bool
 	// String bytecode ops can ask for the same address repeatedly. These fields
 	// keep netip.Addr.String out of the hot path after the first conversion.
-	srcStringVal string
-	dstStringVal string
-	srcStringSet bool
-	dstStringSet bool
+	srcStringVal    string
+	dstStringVal    string
+	srcStringSet    bool
+	dstStringSet    bool
+	srcReverseDone  bool
+	dstReverseDone  bool
+	srcReverseNames []string
+	dstReverseNames []string
 	// cacheNow makes all OP_RULE cache lookups within one packet use one time
 	// sample. cacheable is cleared when a matcher or flow-construction error
 	// should prevent writing the final route result.
@@ -942,13 +958,13 @@ func (ev *splitEval) predicates(
 			case OP_TCP:
 				got = pkt.proto == 6
 			case OP_ADDR_S:
-				got = ev.dstString() == cfg.strings[pred.param]
+				got = ev.matchDstString(cfg.strings[pred.param])
 			case OP_LADDR_S:
-				got = ev.srcString() == cfg.strings[pred.param]
+				got = ev.matchSrcString(cfg.strings[pred.param])
 			case OP_ADDR_RE:
-				got = cfg.regexps[pred.param].MatchString(ev.dstString())
+				got = ev.matchDstRegexp(cfg.regexps[pred.param])
 			case OP_LADDR_RE:
-				got = cfg.regexps[pred.param].MatchString(ev.srcString())
+				got = ev.matchSrcRegexp(cfg.regexps[pred.param])
 			case OP_ADDR4:
 				got = pkt.dst4 == cfg.ipv4Addrs[pred.param] && pkt.dst.Is4()
 			case OP_LADDR4:
@@ -998,13 +1014,13 @@ func (ev *splitEval) predicates(
 		case OP_TCP:
 			got = pkt.proto == 6
 		case OP_ADDR_S:
-			got = ev.dstString() == cfg.strings[pred.param]
+			got = ev.matchDstString(cfg.strings[pred.param])
 		case OP_LADDR_S:
-			got = ev.srcString() == cfg.strings[pred.param]
+			got = ev.matchSrcString(cfg.strings[pred.param])
 		case OP_ADDR_RE:
-			got = cfg.regexps[pred.param].MatchString(ev.dstString())
+			got = ev.matchDstRegexp(cfg.regexps[pred.param])
 		case OP_LADDR_RE:
-			got = cfg.regexps[pred.param].MatchString(ev.srcString())
+			got = ev.matchSrcRegexp(cfg.regexps[pred.param])
 		case OP_ADDR4:
 			got = pkt.dst4 == cfg.ipv4Addrs[pred.param] && pkt.dst.Is4()
 		case OP_LADDR4:
@@ -1057,13 +1073,13 @@ func (ev *splitEval) atom(op byte, param uint16) bool {
 	case OP_TCP:
 		return pkt.proto == 6
 	case OP_ADDR_S:
-		return ev.dstString() == cfg.strings[param]
+		return ev.matchDstString(cfg.strings[param])
 	case OP_LADDR_S:
-		return ev.srcString() == cfg.strings[param]
+		return ev.matchSrcString(cfg.strings[param])
 	case OP_ADDR_RE:
-		return cfg.regexps[param].MatchString(ev.dstString())
+		return ev.matchDstRegexp(cfg.regexps[param])
 	case OP_LADDR_RE:
-		return cfg.regexps[param].MatchString(ev.srcString())
+		return ev.matchSrcRegexp(cfg.regexps[param])
 	case OP_ADDR4:
 		return pkt.dst4 == cfg.ipv4Addrs[param] && pkt.dst.Is4()
 	case OP_LADDR4:
@@ -1165,6 +1181,88 @@ func (ev *splitEval) dstString() string {
 		ev.dstStringSet = true
 	}
 	return ev.dstStringVal
+}
+
+func (ev *splitEval) matchSrcString(want string) bool {
+	if ev.srcString() == want {
+		return true
+	}
+	for _, name := range ev.srcReverseDNSNames() {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (ev *splitEval) matchDstString(want string) bool {
+	if ev.dstString() == want {
+		return true
+	}
+	for _, name := range ev.dstReverseDNSNames() {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (ev *splitEval) matchSrcRegexp(re *regexp.Regexp) bool {
+	if re.MatchString(ev.srcString()) {
+		return true
+	}
+	for _, name := range ev.srcReverseDNSNames() {
+		if re.MatchString(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ev *splitEval) matchDstRegexp(re *regexp.Regexp) bool {
+	if re.MatchString(ev.dstString()) {
+		return true
+	}
+	for _, name := range ev.dstReverseDNSNames() {
+		if re.MatchString(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ev *splitEval) srcReverseDNSNames() []string {
+	if ev.srcReverseDone {
+		return ev.srcReverseNames
+	}
+	if ev.cfg.dnsStorage == nil || !ev.cfg.routeStringOps.local {
+		return nil
+	}
+	ev.srcReverseDone = true
+	ev.cacheable = false
+	ev.srcReverseNames = reverseDNSNames(
+		ev.cfg.dnsStorage,
+		ev.packet.src,
+		time.Unix(0, ev.now()),
+	)
+	return ev.srcReverseNames
+}
+
+func (ev *splitEval) dstReverseDNSNames() []string {
+	if ev.dstReverseDone {
+		return ev.dstReverseNames
+	}
+	if ev.cfg.dnsStorage == nil || !ev.cfg.routeStringOps.remote {
+		return nil
+	}
+	ev.dstReverseDone = true
+	ev.cacheable = false
+	ev.dstReverseNames = reverseDNSNames(
+		ev.cfg.dnsStorage,
+		ev.packet.dst,
+		time.Unix(0, ev.now()),
+	)
+	return ev.dstReverseNames
 }
 
 // now returns a stable timestamp for all OP_RULE cache reads in one packet. Set
